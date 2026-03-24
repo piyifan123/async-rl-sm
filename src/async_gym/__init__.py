@@ -7,6 +7,7 @@ from async_gym.scheduler import (
     GreedyFIFOScheduler,
     Scheduler,
     SchedulerView,
+    SRPTAgingScheduler,
 )
 from async_gym.simulation import (
     SimConfig,
@@ -24,6 +25,7 @@ __all__: list[str] = [
     "GreedyFIFOScheduler",
     "InFlight",
     "ReplicaPool",
+    "SRPTAgingScheduler",
     "Scenario",
     "Scheduler",
     "SchedulerView",

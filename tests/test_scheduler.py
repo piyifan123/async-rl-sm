@@ -11,6 +11,7 @@ from async_gym.scheduler import (
     DispatchAction,
     GreedyFIFOScheduler,
     SchedulerView,
+    SRPTAgingScheduler,
 )
 from async_gym.simulation import (
     SimConfig,
@@ -578,3 +579,332 @@ class TestDispatchAction:
         action = DispatchAction(task=t, count=1)
         with pytest.raises(AttributeError):
             action.count = 5  # type: ignore[misc]
+
+
+# ==================================================================
+# SRPTAgingScheduler
+# ==================================================================
+
+
+# ------------------------------------------------------------------
+# SRPTAgingScheduler constructor
+# ------------------------------------------------------------------
+
+
+class TestSRPTAgingConstructor:
+    def test_default_aging_factor(self) -> None:
+        sched = SRPTAgingScheduler()
+        assert sched.aging_factor == 1.0
+
+    def test_custom_aging_factor(self) -> None:
+        sched = SRPTAgingScheduler(aging_factor=0.5)
+        assert sched.aging_factor == 0.5
+
+    def test_zero_aging_factor(self) -> None:
+        sched = SRPTAgingScheduler(aging_factor=0.0)
+        assert sched.aging_factor == 0.0
+
+    def test_rejects_negative_aging_factor(self) -> None:
+        with pytest.raises(ValueError, match="aging_factor must be >= 0"):
+            SRPTAgingScheduler(aging_factor=-0.1)
+
+
+# ------------------------------------------------------------------
+# SRPTAgingScheduler.name
+# ------------------------------------------------------------------
+
+
+class TestSRPTAgingName:
+    def test_name(self) -> None:
+        assert SRPTAgingScheduler().name == "srpt-aging"
+
+
+# ------------------------------------------------------------------
+# SRPTAgingScheduler.should_admit
+# ------------------------------------------------------------------
+
+
+class TestSRPTAgingAdmission:
+    def test_admits_when_under_cap(self) -> None:
+        sched = SRPTAgingScheduler()
+        task = _make_task()
+        view = _make_view(pipeline_cap=4, active_count=2)
+        assert sched.should_admit(task, 2, view) is True
+
+    def test_rejects_when_at_cap(self) -> None:
+        sched = SRPTAgingScheduler()
+        task = _make_task()
+        view = _make_view(pipeline_cap=4)
+        assert sched.should_admit(task, 4, view) is False
+
+    def test_rejects_when_above_cap(self) -> None:
+        sched = SRPTAgingScheduler()
+        task = _make_task()
+        view = _make_view(pipeline_cap=2)
+        assert sched.should_admit(task, 3, view) is False
+
+    def test_admits_with_zero_active(self) -> None:
+        sched = SRPTAgingScheduler()
+        task = _make_task()
+        view = _make_view(pipeline_cap=1)
+        assert sched.should_admit(task, 0, view) is True
+
+    def test_records_admission_tick(self) -> None:
+        sched = SRPTAgingScheduler()
+        task = _make_task("t0")
+        view = _make_view(pipeline_cap=4, tick=5)
+        sched.should_admit(task, 0, view)
+        assert sched._admission_ticks["t0"] == 5  # noqa: SLF001
+
+
+# ------------------------------------------------------------------
+# SRPTAgingScheduler.plan_rollout_dispatch
+# ------------------------------------------------------------------
+
+
+class TestSRPTAgingRolloutDispatch:
+    def test_empty_when_no_tasks(self) -> None:
+        sched = SRPTAgingScheduler()
+        view = _make_view(inference_available=4)
+        assert sched.plan_rollout_dispatch([], view) == []
+
+    def test_skips_terminal_tasks(self) -> None:
+        sched = SRPTAgingScheduler()
+        t = _make_task(n_trajectories=1)
+        _admit_task(t)
+        t.submit_rollouts([1])
+        t.tick()
+        t.submit_judges([1])
+        t.tick()
+        t.consume()
+        assert t.state == TaskState.CONSUMED
+        view = _make_view(inference_available=4)
+        assert sched.plan_rollout_dispatch([t], view) == []
+
+    def test_skips_pending_tasks(self) -> None:
+        sched = SRPTAgingScheduler()
+        t = _make_task()
+        view = _make_view(inference_available=4)
+        assert sched.plan_rollout_dispatch([t], view) == []
+
+    def test_greedy_allocation(self) -> None:
+        sched = SRPTAgingScheduler()
+        t = _make_task(n_trajectories=4)
+        _admit_task(t)
+        sched._admission_ticks[t.task_id] = 0  # noqa: SLF001
+        view = _make_view(inference_available=4)
+        actions = sched.plan_rollout_dispatch([t], view)
+        assert len(actions) == 1
+        assert actions[0].task is t
+        assert actions[0].count == 4
+
+    def test_capped_by_available(self) -> None:
+        sched = SRPTAgingScheduler()
+        t = _make_task(n_trajectories=8)
+        _admit_task(t)
+        sched._admission_ticks[t.task_id] = 0  # noqa: SLF001
+        view = _make_view(inference_available=3)
+        actions = sched.plan_rollout_dispatch([t], view)
+        assert actions[0].count == 3
+
+    def test_prefers_shorter_remaining(self) -> None:
+        """Task with fewer pending_rollout is dispatched first."""
+        sched = SRPTAgingScheduler(aging_factor=0.0)
+        t_small = _make_task("small", n_trajectories=2)
+        t_large = _make_task("large", n_trajectories=8)
+        _admit_task(t_small)
+        _admit_task(t_large)
+        sched._admission_ticks["small"] = 0  # noqa: SLF001
+        sched._admission_ticks["large"] = 0  # noqa: SLF001
+        view = _make_view(inference_available=3, tick=0)
+        actions = sched.plan_rollout_dispatch([t_large, t_small], view)
+        assert actions[0].task is t_small
+
+    def test_aging_promotes_old_task(self) -> None:
+        """A large task that has waited long enough overtakes a small task."""
+        sched = SRPTAgingScheduler(aging_factor=1.0)
+        t_small = _make_task("small", n_trajectories=2)
+        t_large = _make_task("large", n_trajectories=8)
+        _admit_task(t_small)
+        _admit_task(t_large)
+        # large admitted at tick 0, small admitted at tick 10
+        sched._admission_ticks["large"] = 0  # noqa: SLF001
+        sched._admission_ticks["small"] = 10  # noqa: SLF001
+        # At tick 10: score(large) = 8 - 1.0*10 = -2, score(small) = 2 - 1.0*0 = 2
+        view = _make_view(inference_available=3, tick=10)
+        actions = sched.plan_rollout_dispatch([t_small, t_large], view)
+        assert actions[0].task is t_large
+
+    def test_tie_broken_by_input_order(self) -> None:
+        """Equal scores preserve the original list position."""
+        sched = SRPTAgingScheduler(aging_factor=0.0)
+        t0 = _make_task("t0", n_trajectories=4)
+        t1 = _make_task("t1", n_trajectories=4)
+        _admit_task(t0)
+        _admit_task(t1)
+        sched._admission_ticks["t0"] = 0  # noqa: SLF001
+        sched._admission_ticks["t1"] = 0  # noqa: SLF001
+        view = _make_view(inference_available=6, tick=0)
+        actions = sched.plan_rollout_dispatch([t0, t1], view)
+        assert len(actions) == 2
+        assert actions[0].task is t0
+        assert actions[1].task is t1
+
+    def test_no_actions_when_zero_available(self) -> None:
+        sched = SRPTAgingScheduler()
+        t = _make_task(n_trajectories=2)
+        _admit_task(t)
+        sched._admission_ticks[t.task_id] = 0  # noqa: SLF001
+        view = _make_view(inference_available=0)
+        assert sched.plan_rollout_dispatch([t], view) == []
+
+    def test_skips_task_with_zero_pending_rollout(self) -> None:
+        sched = SRPTAgingScheduler()
+        t = _make_task(n_trajectories=2)
+        _admit_task(t)
+        sched._admission_ticks[t.task_id] = 0  # noqa: SLF001
+        t.submit_rollouts([1, 1])
+        assert t.pending_rollout == 0
+        view = _make_view(inference_available=4)
+        assert sched.plan_rollout_dispatch([t], view) == []
+
+
+# ------------------------------------------------------------------
+# SRPTAgingScheduler.plan_judge_dispatch
+# ------------------------------------------------------------------
+
+
+class TestSRPTAgingJudgeDispatch:
+    def test_empty_when_no_tasks(self) -> None:
+        sched = SRPTAgingScheduler()
+        view = _make_view(judge_available=4)
+        assert sched.plan_judge_dispatch([], view) == []
+
+    def test_dispatches_pending_judges(self) -> None:
+        sched = SRPTAgingScheduler()
+        t = _make_task(n_trajectories=2)
+        _admit_task(t)
+        sched._admission_ticks[t.task_id] = 0  # noqa: SLF001
+        t.submit_rollouts([1, 1])
+        t.tick()
+        assert t.pending_judge == 2
+        view = _make_view(judge_available=4)
+        actions = sched.plan_judge_dispatch([t], view)
+        assert len(actions) == 1
+        assert actions[0].count == 2
+
+    def test_capped_by_available(self) -> None:
+        sched = SRPTAgingScheduler()
+        t = _make_task(n_trajectories=4)
+        _admit_task(t)
+        sched._admission_ticks[t.task_id] = 0  # noqa: SLF001
+        t.submit_rollouts([1, 1, 1, 1])
+        t.tick()
+        assert t.pending_judge == 4
+        view = _make_view(judge_available=2)
+        actions = sched.plan_judge_dispatch([t], view)
+        assert actions[0].count == 2
+
+    def test_prefers_shorter_remaining_judges(self) -> None:
+        """Task with fewer pending_judge is dispatched first."""
+        sched = SRPTAgingScheduler(aging_factor=0.0)
+        t_small = _make_task("small", n_trajectories=2)
+        t_large = _make_task("large", n_trajectories=6)
+        _admit_task(t_small)
+        _admit_task(t_large)
+        sched._admission_ticks["small"] = 0  # noqa: SLF001
+        sched._admission_ticks["large"] = 0  # noqa: SLF001
+        t_small.submit_rollouts([1, 1])
+        t_small.tick()
+        t_large.submit_rollouts([1, 1, 1, 1, 1, 1])
+        t_large.tick()
+        assert t_small.pending_judge == 2
+        assert t_large.pending_judge == 6
+        view = _make_view(judge_available=3, tick=0)
+        actions = sched.plan_judge_dispatch([t_large, t_small], view)
+        assert actions[0].task is t_small
+
+    def test_aging_promotes_old_task_judges(self) -> None:
+        """Aging boosts long-waiting task in judge dispatch."""
+        sched = SRPTAgingScheduler(aging_factor=1.0)
+        t_small = _make_task("small", n_trajectories=2)
+        t_large = _make_task("large", n_trajectories=6)
+        _admit_task(t_small)
+        _admit_task(t_large)
+        sched._admission_ticks["large"] = 0  # noqa: SLF001
+        sched._admission_ticks["small"] = 10  # noqa: SLF001
+        t_small.submit_rollouts([1, 1])
+        t_small.tick()
+        t_large.submit_rollouts([1, 1, 1, 1, 1, 1])
+        t_large.tick()
+        # tick=10: score(large) = 6 - 1*10 = -4, score(small) = 2 - 1*0 = 2
+        view = _make_view(judge_available=3, tick=10)
+        actions = sched.plan_judge_dispatch([t_small, t_large], view)
+        assert actions[0].task is t_large
+
+
+# ------------------------------------------------------------------
+# SRPTAgingScheduler integration with Simulation
+# ------------------------------------------------------------------
+
+
+class TestSRPTAgingIntegration:
+    """Run SRPTAgingScheduler through full simulations across scenarios."""
+
+    @pytest.fixture(params=list(SCENARIOS.keys()))
+    def scenario_name(self, request: pytest.FixtureRequest) -> str:
+        return request.param
+
+    def test_completes_all_scenarios(self, scenario_name: str) -> None:
+        """SRPT-Aging completes every registered scenario without errors."""
+        config = get_scenario(scenario_name).config
+        sim = Simulation(config, scheduler=SRPTAgingScheduler())
+        result = sim.run()
+        assert result.tasks_completed + result.tasks_dropped == config.n_tasks
+        assert result.ticks_elapsed > 0
+
+    def test_pool_invariants(self, scenario_name: str) -> None:
+        """Utilizations stay in [0, 1] and pools are drained at the end."""
+        config = get_scenario(scenario_name).config
+        sim = Simulation(config, scheduler=SRPTAgingScheduler())
+        result = sim.run()
+        for stats in result.history:
+            assert 0.0 <= stats.inference_utilization <= 1.0
+            assert 0.0 <= stats.judge_utilization <= 1.0
+        assert sim.inference_pool.in_use == 0
+        assert sim.judge_pool.in_use == 0
+
+    def test_deterministic(self) -> None:
+        """Same seed produces identical results."""
+        cfg = SimConfig(
+            n_tasks=10,
+            n_trajectories=4,
+            inference_capacity=4,
+            judge_capacity=4,
+            rollout_duration_fn=uniform_duration(1, 5),
+            judge_duration_fn=uniform_duration(1, 3),
+            batch_size=2,
+            max_staleness=3,
+            seed=99,
+        )
+        r1 = Simulation(cfg, scheduler=SRPTAgingScheduler()).run()
+        r2 = Simulation(cfg, scheduler=SRPTAgingScheduler()).run()
+        assert r1.ticks_elapsed == r2.ticks_elapsed
+        assert r1.tasks_completed == r2.tasks_completed
+        assert r1.tasks_dropped == r2.tasks_dropped
+
+    def test_zero_aging_is_pure_srpt(self) -> None:
+        """With aging_factor=0, result may differ from FIFO (pure SRPT)."""
+        cfg = SimConfig(
+            n_tasks=8,
+            n_trajectories=4,
+            inference_capacity=4,
+            judge_capacity=4,
+            rollout_duration_fn=constant_duration(2),
+            judge_duration_fn=constant_duration(1),
+            batch_size=2,
+            max_staleness=5,
+            seed=42,
+        )
+        result = Simulation(cfg, scheduler=SRPTAgingScheduler(aging_factor=0.0)).run()
+        assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks

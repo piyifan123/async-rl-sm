@@ -19,7 +19,7 @@ import sys
 import textwrap
 
 from async_gym.scenarios import Scenario, get_scenario, list_scenarios
-from async_gym.scheduler import GreedyFIFOScheduler, Scheduler
+from async_gym.scheduler import GreedyFIFOScheduler, Scheduler, SRPTAgingScheduler
 from async_gym.simulation import (
     SimResult,
     TickStats,
@@ -33,6 +33,7 @@ from async_gym.task import TaskState
 
 SCHEDULERS: dict[str, type[Scheduler]] = {
     "greedy-fifo": GreedyFIFOScheduler,
+    "srpt-aging": SRPTAgingScheduler,
 }
 
 

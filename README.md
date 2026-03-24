@@ -26,7 +26,9 @@ uv run run_sim.py --scenario adversarial                 # run one scenario by n
 uv run run_sim.py --scenario default adversarial         # run several scenarios
 uv run run_sim.py --all                                  # run all registered scenarios
 uv run run_sim.py --scheduler greedy-fifo                # specify scheduler algorithm
-uv run run_sim.py --scenario default --scheduler greedy-fifo  # combine both
+uv run run_sim.py --scheduler srpt-aging                 # use SRPT-Aging scheduler
+uv run run_sim.py --scenario default --scheduler srpt-aging   # combine scenario + scheduler
+uv run run_sim.py --all --scheduler srpt-aging           # all scenarios with SRPT-Aging
 uv run run_sim.py --list                                 # list available scenarios
 uv run run_sim.py --list-schedulers                      # list available schedulers
 ```
@@ -51,6 +53,7 @@ tick.  Use `--list-schedulers` to see all registered schedulers.
 | Name | Strategy |
 |------|----------|
 | `greedy-fifo` | Iterate tasks in creation order; each task greedily takes `min(pending, available)` slots. Pipeline-cap admission. |
+| `srpt-aging` | Shortest Remaining Processing Time with aging. Prefer tasks with less remaining work; apply a linear age boost to prevent starvation. See [docs/scheduling.md](docs/scheduling.md). |
 
 ### Comparing schedulers
 
@@ -59,15 +62,16 @@ schedulers:
 
 ```bash
 uv run run_sim.py --scenario adversarial --scheduler greedy-fifo
+uv run run_sim.py --scenario adversarial --scheduler srpt-aging
 ```
 
 Or compare programmatically:
 
 ```python
-from async_gym import SimConfig, Simulation, GreedyFIFOScheduler, get_scenario
+from async_gym import SimConfig, Simulation, GreedyFIFOScheduler, SRPTAgingScheduler, get_scenario
 
 config = get_scenario("default").config
-for scheduler in [GreedyFIFOScheduler()]:
+for scheduler in [GreedyFIFOScheduler(), SRPTAgingScheduler()]:
     result = Simulation(config, scheduler=scheduler).run()
     print(f"{scheduler.name}: {result.ticks_elapsed} ticks, "
           f"{result.tasks_dropped} dropped")
@@ -138,7 +142,7 @@ async-rl-state/
 │   ├── __init__.py          # Public API exports
 │   ├── task.py              # Task state machine (per-task trajectory pipeline)
 │   ├── replica_pool.py      # ReplicaPool (shared capacity constraint)
-│   ├── scheduler.py         # Scheduler ABC, GreedyFIFOScheduler, DispatchAction
+│   ├── scheduler.py         # Scheduler ABC, GreedyFIFOScheduler, SRPTAgingScheduler
 │   ├── simulation.py        # SimConfig, Simulation runner, duration helpers
 │   └── scenarios.py         # Named scenario registry (Scenario, get_scenario, list_scenarios)
 ├── tests/
@@ -148,7 +152,8 @@ async-rl-state/
 │   ├── test_scheduler.py
 │   └── test_scenarios.py
 ├── docs/
-│   └── design.md            # Architecture and design decisions
+│   ├── design.md            # Architecture and design decisions
+│   └── scheduling.md        # Scheduling algorithms and queueing-theory analysis
 ├── run_sim.py               # Entry-point script (multi-scenario, multi-scheduler CLI)
 └── pyproject.toml
 ```

@@ -13,6 +13,12 @@ each tick:
 :class:`GreedyFIFOScheduler` replicates the original hard-coded behaviour:
 creation-order iteration, greedy ``min(pending, available)`` allocation, and
 pipeline-cap admission.
+
+:class:`SRPTAgingScheduler` prioritises tasks with less remaining work
+(Shortest Remaining Processing Time) while applying a linear aging boost
+so that long-running tasks are not starved indefinitely.  See
+``docs/scheduling.md`` for the full algorithm description and queueing-theory
+analysis.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from async_gym.task import Task, TaskState
 __all__ = [
     "DispatchAction",
     "GreedyFIFOScheduler",
+    "SRPTAgingScheduler",
     "Scheduler",
     "SchedulerView",
 ]
@@ -280,6 +287,183 @@ class GreedyFIFOScheduler(Scheduler):
                 break
             if task.state in _TERMINAL_STATES or task.birth_ckpt is None:
                 continue
+            n = min(task.pending_judge, remaining)
+            if n > 0:
+                actions.append(DispatchAction(task=task, count=n))
+                remaining -= n
+        return actions
+
+
+# ------------------------------------------------------------------
+# SRPT + Aging implementation
+# ------------------------------------------------------------------
+
+
+class SRPTAgingScheduler(Scheduler):
+    """Shortest-Remaining-Processing-Time scheduler with aging.
+
+    Dispatch priority is determined by the score::
+
+        score(task) = pending_work - aging_factor * age_ticks
+
+    where *pending_work* is ``pending_rollout`` (rollout phase) or
+    ``pending_judge`` (judge phase), and *age_ticks* is the number of
+    ticks since the task was admitted.  Tasks with **lower** scores are
+    dispatched first.  Ties are broken by input-list order for stability.
+
+    - ``aging_factor = 0`` yields pure SRPT (prefer short remaining work).
+    - Large ``aging_factor`` approaches FIFO (oldest tasks first).
+
+    **Starvation bound**: a task with *W* remaining work overtakes a
+    competing task with *w < W* remaining work after at most
+    ``(W - w) / aging_factor`` idle ticks.
+
+    **Admission** is identical to :class:`GreedyFIFOScheduler` — admit while
+    ``active_count < pipeline_cap``.
+
+    Args:
+        aging_factor: Non-negative weight applied to each tick of age.
+            Defaults to ``1.0``.
+
+    Raises:
+        ValueError: If *aging_factor* is negative.
+    """
+
+    def __init__(self, aging_factor: float = 1.0) -> None:
+        if aging_factor < 0:
+            raise ValueError(f"aging_factor must be >= 0, got {aging_factor}")
+        self._aging_factor = aging_factor
+        self._admission_ticks: dict[str, int] = {}
+
+    @property
+    def name(self) -> str:
+        """Return ``'srpt-aging'``."""
+        return "srpt-aging"
+
+    @property
+    def aging_factor(self) -> float:
+        """The aging weight used in the priority score."""
+        return self._aging_factor
+
+    def should_admit(
+        self,
+        task: Task,
+        active_count: int,
+        view: SchedulerView,
+    ) -> bool:
+        """Admit while under the pipeline cap (same as baseline).
+
+        Also records the admission tick for later age computation.
+
+        Args:
+            task: A PENDING task.
+            active_count: Live count of active tasks.
+            view: Simulation state snapshot.
+
+        Returns:
+            ``True`` if ``active_count < view.pipeline_cap``.
+        """
+        if active_count < view.pipeline_cap:
+            self._admission_ticks[task.task_id] = view.tick
+            return True
+        return False
+
+    def _score(self, pending: int, task_id: str, current_tick: int) -> float:
+        """Compute the dispatch priority score for a task.
+
+        Lower scores receive slots first.
+
+        Args:
+            pending: Remaining work items (rollouts or judges).
+            task_id: Identifier used to look up the admission tick.
+            current_tick: The current simulation tick.
+
+        Returns:
+            ``pending - aging_factor * age_ticks``.
+        """
+        admission_tick = self._admission_ticks.get(task_id, current_tick)
+        age = current_tick - admission_tick
+        return pending - self._aging_factor * age
+
+    def _sorted_candidates(
+        self,
+        tasks: Sequence[Task],
+        pending_attr: str,
+        current_tick: int,
+    ) -> list[tuple[float, int, Task]]:
+        """Filter and sort tasks by priority score.
+
+        Args:
+            tasks: All simulation tasks.
+            pending_attr: ``'pending_rollout'`` or ``'pending_judge'``.
+            current_tick: The current simulation tick.
+
+        Returns:
+            List of ``(score, original_index, task)`` sorted ascending by
+            score then by original index for tie-breaking stability.
+        """
+        candidates: list[tuple[float, int, Task]] = []
+        for idx, task in enumerate(tasks):
+            if task.state in _TERMINAL_STATES or task.birth_ckpt is None:
+                continue
+            pending: int = getattr(task, pending_attr)
+            if pending <= 0:
+                continue
+            score = self._score(pending, task.task_id, current_tick)
+            candidates.append((score, idx, task))
+        candidates.sort(key=lambda c: (c[0], c[1]))
+        return candidates
+
+    def plan_rollout_dispatch(
+        self,
+        tasks: Sequence[Task],
+        view: SchedulerView,
+    ) -> list[DispatchAction]:
+        """SRPT-with-aging rollout allocation.
+
+        Tasks are sorted by ``pending_rollout - aging_factor * age``,
+        then greedily allocated ``min(pending_rollout, remaining_slots)``.
+
+        Args:
+            tasks: All simulation tasks.
+            view: Simulation state snapshot.
+
+        Returns:
+            Ordered list of rollout dispatch actions.
+        """
+        actions: list[DispatchAction] = []
+        remaining = view.inference_available
+        for _score, _idx, task in self._sorted_candidates(tasks, "pending_rollout", view.tick):
+            if remaining <= 0:
+                break
+            n = min(task.pending_rollout, remaining)
+            if n > 0:
+                actions.append(DispatchAction(task=task, count=n))
+                remaining -= n
+        return actions
+
+    def plan_judge_dispatch(
+        self,
+        tasks: Sequence[Task],
+        view: SchedulerView,
+    ) -> list[DispatchAction]:
+        """SRPT-with-aging judge allocation.
+
+        Tasks are sorted by ``pending_judge - aging_factor * age``,
+        then greedily allocated ``min(pending_judge, remaining_slots)``.
+
+        Args:
+            tasks: All simulation tasks.
+            view: Simulation state snapshot.
+
+        Returns:
+            Ordered list of judge dispatch actions.
+        """
+        actions: list[DispatchAction] = []
+        remaining = view.judge_available
+        for _score, _idx, task in self._sorted_candidates(tasks, "pending_judge", view.tick):
+            if remaining <= 0:
+                break
             n = min(task.pending_judge, remaining)
             if n > 0:
                 actions.append(DispatchAction(task=task, count=n))

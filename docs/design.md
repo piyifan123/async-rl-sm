@@ -631,10 +631,13 @@ If no scheduler is passed, `Simulation` defaults to `GreedyFIFOScheduler()`.
 Subclass `Scheduler` and implement the three abstract methods, or subclass
 `GreedyFIFOScheduler` to override only the hooks you want to change.
 
-Example strategies:
+The built-in `SRPTAgingScheduler` demonstrates this: it overrides both
+dispatch hooks to sort tasks by remaining work with an aging boost that
+prevents starvation.  See [scheduling.md](scheduling.md) for the full
+algorithm description and queueing-theory analysis.
 
-- **Completion-priority** — sort tasks by fewest remaining rollouts/judges,
-  so near-complete tasks reach READY faster and fill training batches sooner.
+Other example strategies:
+
 - **Fair-share** — spread slots evenly across active tasks instead of greedy
   first-come-first-served.
 - **Back-pressure** — tighten admission (e.g. also require
