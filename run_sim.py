@@ -1,59 +1,28 @@
 #!/usr/bin/env python3
-"""Run an async-RL scheduling simulation and print a summary.
+"""Run async-RL scheduling simulation scenarios and print summaries.
 
 Usage::
 
-    uv run run_sim.py                 # default config
-    uv run run_sim.py --adversarial   # high-variance config that triggers many drops
+    uv run run_sim.py                                # run "default" scenario
+    uv run run_sim.py --scenario adversarial         # run one scenario by name
+    uv run run_sim.py --scenario default adversarial # run several by name
+    uv run run_sim.py --all                          # run all registered scenarios
+    uv run run_sim.py --list                         # list available scenarios and exit
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
+import textwrap
 
+from async_gym.scenarios import Scenario, get_scenario, list_scenarios
 from async_gym.simulation import (
-    SimConfig,
     SimResult,
-    Simulation,
     TickStats,
-    constant_duration,
     describe_duration_fn,
-    uniform_duration,
 )
 from async_gym.task import TaskState
-
-# ------------------------------------------------------------------
-# Default configuration
-# ------------------------------------------------------------------
-
-CONFIG = SimConfig(
-    n_tasks=20,
-    n_trajectories=8,
-    inference_capacity=8,
-    judge_capacity=4,
-    rollout_duration_fn=uniform_duration(2, 10),
-    judge_duration_fn=uniform_duration(1, 4),
-    batch_size=4,
-    training_speed=20.0,
-    max_staleness=3,
-    seed=0,
-)
-
-ADVERSARIAL_CONFIG = SimConfig(
-    n_tasks=20,
-    n_trajectories=1,
-    inference_capacity=4,
-    judge_capacity=4,
-    rollout_duration_fn=uniform_duration(1, 200),
-    judge_duration_fn=constant_duration(1),
-    batch_size=1,
-    training_speed=1000.0,
-    max_staleness=2,
-    seed=42,
-)
-
-SNAPSHOT_INTERVAL = 10
-
 
 # ------------------------------------------------------------------
 # Formatting helpers
@@ -95,15 +64,21 @@ def _format_state_distribution(stats: TickStats) -> str:
     return "  ".join(parts)
 
 
-def _print_header(cfg: SimConfig) -> None:
-    """Print the simulation configuration header.
+def _print_header(scenario: Scenario) -> None:
+    """Print the scenario description and simulation configuration header.
 
     Args:
-        cfg: The simulation config to summarise.
+        scenario: The scenario to display.
     """
+    cfg = scenario.config
+    print("=" * 120)
+    print(f"Scenario: {scenario.name}")
+    wrapped = textwrap.fill(scenario.description, width=114)
+    for line in wrapped.splitlines():
+        print(f"  {line}")
     print("=" * 120)
     print("Async-RL Scheduling Simulation")
-    print("=" * 120)
+    print("-" * 120)
     print(f"  Tasks:                {cfg.n_tasks}")
     print(f"  Trajectories/task:    {cfg.n_trajectories}")
     print(f"  Inference capacity:   {cfg.inference_capacity}")
@@ -124,6 +99,10 @@ def _print_header(cfg: SimConfig) -> None:
 def _print_snapshots(history: list[TickStats], interval: int) -> None:
     """Print periodic tick snapshots.
 
+    In addition to every *interval*-th tick and the final tick, any tick
+    where a task is dropped or consumed is always printed so that key
+    events are never hidden by a large interval.
+
     Args:
         history: Full tick history from the simulation.
         interval: Print every *interval*-th tick plus the final tick.
@@ -139,7 +118,8 @@ def _print_snapshots(history: list[TickStats], interval: int) -> None:
     for stats in history:
         is_periodic = stats.tick % interval == 0
         is_last = stats.tick == history[-1].tick
-        if not (is_periodic or is_last):
+        has_event = stats.tasks_dropped > 0 or stats.tasks_consumed > 0
+        if not (is_periodic or is_last or has_event):
             continue
 
         trn_dur = str(stats.training_ticks_total) if stats.training_active else ""
@@ -191,24 +171,94 @@ def _print_summary(result: SimResult) -> None:
     print("=" * 120)
 
 
+def _run_scenario(scenario: Scenario) -> None:
+    """Run a single scenario and print its full output.
+
+    Args:
+        scenario: The scenario to execute.
+    """
+    from async_gym.simulation import Simulation
+
+    _print_header(scenario)
+
+    sim = Simulation(scenario.config)
+    result = sim.run()
+
+    _print_snapshots(result.history, scenario.snapshot_interval)
+    _print_summary(result)
+
+
+def _list_scenarios() -> None:
+    """Print a table of all registered scenarios and exit."""
+    scenarios = list_scenarios()
+    print(f"{'Name':<20}  Description")
+    print("-" * 80)
+    for s in scenarios:
+        first_line = textwrap.shorten(s.description, width=58, placeholder="...")
+        print(f"{s.name:<20}  {first_line}")
+
+
 # ------------------------------------------------------------------
-# Main
+# CLI
 # ------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser.
+
+    Returns:
+        A configured :class:`argparse.ArgumentParser`.
+    """
+    parser = argparse.ArgumentParser(
+        description="Run async-RL scheduling simulation scenarios.",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--scenario",
+        nargs="+",
+        metavar="NAME",
+        help="One or more scenario names to run (default: 'default').",
+    )
+    group.add_argument(
+        "--all",
+        action="store_true",
+        dest="run_all",
+        help="Run all registered scenarios.",
+    )
+    group.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_scenarios",
+        help="List available scenarios and exit.",
+    )
+    return parser
 
 
 def main() -> None:
-    """Run the simulation with the chosen config and print results."""
-    use_adversarial = "--adversarial" in sys.argv
-    cfg = ADVERSARIAL_CONFIG if use_adversarial else CONFIG
-    interval = 1 if use_adversarial else SNAPSHOT_INTERVAL
+    """Parse CLI arguments, resolve scenarios, and run them."""
+    parser = _build_parser()
+    args = parser.parse_args()
 
-    _print_header(cfg)
+    if args.list_scenarios:
+        _list_scenarios()
+        sys.exit(0)
 
-    sim = Simulation(cfg)
-    result = sim.run()
+    if args.run_all:
+        scenarios = list_scenarios()
+    elif args.scenario:
+        scenarios = []
+        for name in args.scenario:
+            try:
+                scenarios.append(get_scenario(name))
+            except KeyError as exc:
+                parser.error(str(exc))
+    else:
+        scenarios = [get_scenario("default")]
 
-    _print_snapshots(result.history, interval)
-    _print_summary(result)
+    for i, scenario in enumerate(scenarios):
+        if i > 0:
+            print("\n\n")
+        _run_scenario(scenario)
 
 
 if __name__ == "__main__":

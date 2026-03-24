@@ -21,37 +21,28 @@ uv sync
 ## Running the simulation
 
 ```bash
-uv run run_sim.py
+uv run run_sim.py                                # run the "default" scenario
+uv run run_sim.py --scenario adversarial         # run one scenario by name
+uv run run_sim.py --scenario default adversarial # run several by name
+uv run run_sim.py --all                          # run all registered scenarios
+uv run run_sim.py --list                         # list available scenarios and exit
 ```
 
-This runs a default scenario (20 tasks, 8 trajectories each, 8 inference / 4
-judge replicas, uniform rollout durations in [2, 10] ticks, uniform judge
-durations in [1, 4] ticks) and prints periodic snapshots with a final summary:
+### Available scenarios
 
-```
-Async-RL Scheduling Simulation
-  Tasks:                20
-  Trajectories/task:    8
-  Inference capacity:   8
-  Judge capacity:       4
-  Max ticks:            100000
-  Seed:                 0
+| Name | Description |
+|------|-------------|
+| `default` | Balanced workload with moderate parallelism. Demonstrates steady-state pipeline utilization. |
+| `adversarial` | Extreme rollout variance (1-200 ticks) with tight staleness. Demonstrates task drops from checkpoint lapping. |
+| `small-constant` | Minimal scenario with constant durations and few tasks. Useful for smoke testing and debugging. |
+| `high-throughput` | High parallelism with large batch size and fast training. Demonstrates batched training throughput. |
 
-  Tick   Inf%   Jdg%  R_disp  J_disp  R_done  J_done  State distribution
-     0  100.0%   0.0%       8       0       0       0  pending=19  rolling_out=1  partial=0  judging=0  ready=0  consumed=0
-    10  100.0%  75.0%       1       1       2       1  pending=17  rolling_out=0  partial=2  judging=0  ready=0  consumed=1
-    ...
-   123   0.0%  25.0%       0       0       0       1  pending=0  rolling_out=0  partial=0  judging=0  ready=0  consumed=20
+Each scenario prints its name, description, configuration, periodic tick
+snapshots, and a final summary.
 
-Summary
-  Ticks elapsed:        124
-  Tasks completed:      20
-  Avg inference util:   94.9%
-  Avg judge util:       87.9%
-```
+### Using the library directly
 
-To customise the simulation, edit the `CONFIG` object in `run_sim.py` or build
-your own script using the library directly:
+You can also build custom configs without registering them as scenarios:
 
 ```python
 from async_gym import SimConfig, Simulation, constant_duration, uniform_duration
@@ -91,14 +82,16 @@ async-rl-state/
 │   ├── __init__.py          # Public API exports
 │   ├── task.py              # Task state machine (per-task trajectory pipeline)
 │   ├── replica_pool.py      # ReplicaPool (shared capacity constraint)
-│   └── simulation.py        # SimConfig, Simulation runner, duration helpers
+│   ├── simulation.py        # SimConfig, Simulation runner, duration helpers
+│   └── scenarios.py         # Named scenario registry (Scenario, get_scenario, list_scenarios)
 ├── tests/
 │   ├── test_task.py
 │   ├── test_replica_pool.py
-│   └── test_simulation.py
+│   ├── test_simulation.py
+│   └── test_scenarios.py
 ├── docs/
 │   └── design.md            # Architecture and design decisions
-├── run_sim.py               # Entry-point script
+├── run_sim.py               # Entry-point script (multi-scenario CLI)
 └── pyproject.toml
 ```
 
