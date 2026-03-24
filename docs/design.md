@@ -348,10 +348,14 @@ is created with the computed duration.
 | `max_ticks` | `int` | Safety tick limit (default 100 000). |
 | `seed` | `int \| None` | RNG seed for reproducibility. |
 
-Two built-in duration factories are provided:
+Three built-in duration factories are provided:
 
 - `constant_duration(value)` — every item takes exactly *value* ticks.
 - `uniform_duration(low, high)` — each item sampled uniformly from `[low, high]`.
+- `bimodal_duration(short, long, p_short=0.8)` — each item is *short* ticks
+  with probability *p_short*, otherwise *long* ticks.  Produces high
+  coefficient-of-variation (CV > 1) workloads that stress scheduling
+  algorithms.  See `docs/scheduling.md` §8 for scenarios using this factory.
 
 ### 4.4 Result types
 

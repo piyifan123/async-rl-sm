@@ -42,6 +42,7 @@ __all__ = [
     "TickStats",
     "SimResult",
     "Simulation",
+    "bimodal_duration",
     "constant_duration",
     "describe_duration_fn",
     "uniform_duration",
@@ -129,6 +130,48 @@ def uniform_duration(low: int, high: int) -> DurationFn:
         return rng.integers(low, high, size=n, endpoint=True).tolist()
 
     _sample.description = f"uniform({low}, {high})"  # type: ignore[attr-defined]
+    return _sample
+
+
+def bimodal_duration(short: int, long: int, p_short: float = 0.8) -> DurationFn:
+    """Return a duration function that draws from a two-point mixture.
+
+    Each sampled duration is *short* with probability *p_short* and *long*
+    otherwise.  This produces high coefficient-of-variation workloads that
+    stress scheduling algorithms — exactly the regime where SRPT-family
+    policies outperform FIFO.
+
+    Args:
+        short: Duration (in ticks) for the "easy" mode (must be >= 1).
+        long: Duration (in ticks) for the "hard" mode (must be > *short*).
+        p_short: Probability of drawing the short duration (0 < p_short < 1).
+
+    Returns:
+        A callable ``(n, rng) -> list[int]`` returning *n* samples from the
+        mixture.
+
+    Raises:
+        ValueError: If *short* < 1, *long* <= *short*, or *p_short* is not
+            in the open interval (0, 1).
+
+    Examples:
+        >>> fn = bimodal_duration(2, 40, p_short=0.8)
+        >>> durations = fn(1000, np.random.default_rng(0))
+        >>> set(durations) == {2, 40}
+        True
+    """
+    if short < 1:
+        raise ValueError(f"short must be >= 1, got {short}")
+    if long <= short:
+        raise ValueError(f"long must be > short ({short}), got {long}")
+    if not (0 < p_short < 1):
+        raise ValueError(f"p_short must be in (0, 1), got {p_short}")
+
+    def _sample(n: int, rng: np.random.Generator) -> list[int]:
+        choices = rng.random(n) < p_short
+        return [short if c else long for c in choices]
+
+    _sample.description = f"bimodal({short}, {long}, p={p_short})"  # type: ignore[attr-defined]
     return _sample
 
 

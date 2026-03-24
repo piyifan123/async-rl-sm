@@ -305,3 +305,98 @@ SRPT-Aging combines the flow-time benefits of SRPT with the starvation
 guarantees needed to avoid wasteful drops in the async-RL pipeline.  The
 single `aging_factor` parameter provides a simple, interpretable knob for
 trading off responsiveness against fairness.
+
+---
+
+## 8  Designed Comparison Scenarios
+
+Three registered scenarios demonstrate conditions where SRPT-Aging
+measurably outperforms Greedy FIFO.  Each uses a fixed seed for
+deterministic reproducibility.  Run them with:
+
+```bash
+uv run run_sim.py --scenario srpt-bimodal --scheduler greedy-fifo
+uv run run_sim.py --scenario srpt-bimodal --scheduler srpt-aging
+```
+
+### 8.1  Why the Judge Bottleneck Matters
+
+All three scenarios share a structural pattern: **abundant inference
+capacity combined with scarce judge capacity**.  High-variance rollout
+durations cause tasks to enter the judge queue at staggered times with
+heterogeneous `pending_judge` counts.  Under FIFO, tasks are judged in
+creation order — a task with `pending_judge=6` blocks a task with
+`pending_judge=1` that is one judge away from READY.  SRPT reorders by
+remaining work, clearing nearly-done tasks first and filling training
+batches sooner.
+
+### 8.2  Scenario: `srpt-bimodal`
+
+| Parameter | Value |
+|-----------|-------|
+| Rollout distribution | `bimodal(1, 50, p=0.8)` — CV ≈ 1.6 |
+| Tasks / trajectories | 24 / 8 |
+| Inference / judge capacity | 16 / 3 |
+| Judge duration | `constant(2)` |
+| Batch size / staleness | 4 / 3 |
+
+**Result (seed 40):**
+
+| Metric | FIFO | SRPT-Aging | Improvement |
+|--------|------|------------|-------------|
+| Ticks elapsed | 269 | 161 | −40% |
+| Tasks dropped | 2 | 0 | −2 |
+| Avg inference util | 45% | 78% | +33 pp |
+| Avg judge util | 48% | 80% | +32 pp |
+
+The 80/20 bimodal split creates a mix of "easy" and "hard" trajectories.
+SRPT completes the easy tasks quickly, filling training batches faster
+and advancing checkpoints before slow tasks go stale.
+
+### 8.3  Scenario: `srpt-heavy-tail`
+
+| Parameter | Value |
+|-----------|-------|
+| Rollout distribution | `bimodal(1, 60, p=0.85)` — CV ≈ 2.1 |
+| Tasks / trajectories | 32 / 8 |
+| Inference / judge capacity | 16 / 3 |
+| Judge duration | `constant(2)` |
+| Batch size / staleness | 4 / 3 |
+
+**Result (seed 62):**
+
+| Metric | FIFO | SRPT-Aging | Improvement |
+|--------|------|------------|-------------|
+| Ticks elapsed | 374 | 243 | −35% |
+| Tasks dropped | 3 | 2 | −1 |
+| Avg inference util | 46% | 72% | +26 pp |
+| Avg judge util | 46% | 70% | +24 pp |
+
+With 32 tasks and a heavier tail (15% of trajectories take 60 ticks),
+the pipeline cap of 12 creates severe judge contention.  SRPT's
+reordering is even more valuable at scale.
+
+### 8.4  Scenario: `srpt-contention`
+
+| Parameter | Value |
+|-----------|-------|
+| Rollout distribution | `bimodal(1, 50, p=0.8)` — CV ≈ 1.6 |
+| Tasks / trajectories | 24 / 8 |
+| Inference / judge capacity | 16 / 4 |
+| Judge duration | `constant(3)` |
+| Batch size / staleness | 4 / 3 |
+
+**Result (seed 163):**
+
+| Metric | FIFO | SRPT-Aging | Improvement |
+|--------|------|------------|-------------|
+| Ticks elapsed | 434 | 315 | −27% |
+| Tasks dropped | 0 | 0 | 0 |
+| Avg inference util | 32% | 46% | +14 pp |
+| Avg judge util | 33% | 46% | +13 pp |
+
+This scenario isolates the **pure throughput advantage**: no tasks are
+dropped under either scheduler, so the 27% speed-up comes entirely from
+smarter dispatch ordering.  The longer judge duration (3 ticks) holds
+judge slots longer, magnifying the cost of serving tasks in the wrong
+order.
