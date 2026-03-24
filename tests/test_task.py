@@ -436,3 +436,73 @@ class TestBirthCkptAndStaleness:
         assert t.state == TaskState.READY
         assert t.birth_ckpt == 0
         assert t.staleness(3) == 3
+
+
+# ------------------------------------------------------------------
+# Drop transition
+# ------------------------------------------------------------------
+
+
+def _make_ready_task(task_id: str = "d0") -> Task:
+    """Create a READY task with birth_ckpt=0 for drop tests."""
+    t = Task(task_id=task_id, n_trajectories=1)
+    t.birth_ckpt = 0
+    t.submit_rollouts([1])
+    t.tick()
+    t.submit_judges([1])
+    t.tick()
+    assert t.state == TaskState.READY
+    return t
+
+
+class TestDrop:
+    def test_drop_on_ready_task(self) -> None:
+        t = _make_ready_task()
+        t.drop()
+        assert t.state == TaskState.DROPPED
+
+    def test_drop_on_non_ready_raises(self) -> None:
+        t = Task(task_id="d1", n_trajectories=N)
+        with pytest.raises(ValueError, match="must be READY"):
+            t.drop()
+
+    def test_drop_on_consumed_raises(self) -> None:
+        t = _make_ready_task()
+        t.consume()
+        with pytest.raises(ValueError, match="must be READY"):
+            t.drop()
+
+    def test_submit_rollouts_after_drop_raises(self) -> None:
+        t = _make_ready_task("dr1")
+        t.drop()
+        with pytest.raises(ValueError, match="dropped"):
+            t.submit_rollouts([1])
+
+    def test_submit_judges_after_drop_raises(self) -> None:
+        t = _make_ready_task("dr2")
+        t.drop()
+        with pytest.raises(ValueError, match="dropped"):
+            t.submit_judges([1])
+
+    def test_tick_after_drop_raises(self) -> None:
+        t = _make_ready_task("dr3")
+        t.drop()
+        with pytest.raises(ValueError, match="dropped"):
+            t.tick()
+
+    def test_consume_after_drop_raises(self) -> None:
+        t = _make_ready_task("dr4")
+        t.drop()
+        with pytest.raises(ValueError, match="must be READY"):
+            t.consume()
+
+    def test_dropped_flag_hidden_in_repr(self) -> None:
+        t = Task(task_id="x", n_trajectories=1)
+        assert "_dropped" not in repr(t)
+
+    def test_staleness_survives_through_drop(self) -> None:
+        """birth_ckpt remains accessible on dropped tasks."""
+        t = _make_ready_task("ds")
+        t.drop()
+        assert t.birth_ckpt == 0
+        assert t.staleness(5) == 5

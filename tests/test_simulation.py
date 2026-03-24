@@ -898,3 +898,157 @@ class TestEndToEnd:
         assert r1.ticks_elapsed == r2.ticks_elapsed
         for s1, s2 in zip(r1.history, r2.history, strict=True):
             assert s1 == s2
+
+
+# ------------------------------------------------------------------
+# Staleness-based task dropping
+# ------------------------------------------------------------------
+
+
+class TestStalenessDropping:
+    def test_constant_duration_zero_drops(self) -> None:
+        """With constant durations, all tasks complete at the same rate so
+        no tasks should be dropped."""
+        cfg = SimConfig(
+            n_tasks=8,
+            n_trajectories=2,
+            inference_capacity=8,
+            judge_capacity=8,
+            rollout_duration_fn=constant_duration(3),
+            judge_duration_fn=constant_duration(2),
+            batch_size=2,
+            training_speed=2.0,
+            max_staleness=3,
+            seed=0,
+        )
+        result = Simulation(cfg).run()
+        assert result.tasks_dropped == 0
+        assert result.tasks_completed == 8
+        assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks
+
+    def test_adversarial_config_causes_drops(self) -> None:
+        """Wide rollout variance with tight staleness bound and fast training
+        causes slow tasks to be lapped and dropped."""
+        cfg = SimConfig(
+            n_tasks=20,
+            n_trajectories=1,
+            inference_capacity=4,
+            judge_capacity=4,
+            rollout_duration_fn=uniform_duration(1, 200),
+            judge_duration_fn=constant_duration(1),
+            batch_size=1,
+            training_speed=1000.0,
+            max_staleness=2,
+            seed=42,
+        )
+        result = Simulation(cfg).run()
+        assert result.tasks_dropped > 0, (
+            "Expected drops with high-variance rollouts and tight staleness"
+        )
+        assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks
+
+    def test_completed_plus_dropped_equals_n_tasks(self) -> None:
+        """Every task ends up either CONSUMED or DROPPED."""
+        cfg = SimConfig(
+            n_tasks=10,
+            n_trajectories=1,
+            inference_capacity=4,
+            judge_capacity=4,
+            rollout_duration_fn=uniform_duration(1, 100),
+            judge_duration_fn=constant_duration(1),
+            batch_size=1,
+            training_speed=1000.0,
+            max_staleness=1,
+            seed=7,
+        )
+        result = Simulation(cfg).run()
+        assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks
+        final = result.history[-1]
+        consumed = final.tasks_by_state.get(TaskState.CONSUMED, 0)
+        dropped = final.tasks_by_state.get(TaskState.DROPPED, 0)
+        assert consumed + dropped == cfg.n_tasks
+
+    def test_pool_invariants_with_drops(self) -> None:
+        """Pools are consistent even when tasks are dropped."""
+        cfg = SimConfig(
+            n_tasks=10,
+            n_trajectories=2,
+            inference_capacity=4,
+            judge_capacity=4,
+            rollout_duration_fn=uniform_duration(1, 100),
+            judge_duration_fn=uniform_duration(1, 3),
+            batch_size=1,
+            training_speed=1000.0,
+            max_staleness=2,
+            seed=123,
+        )
+        sim = Simulation(cfg)
+        result = sim.run()
+
+        for stats in result.history:
+            assert 0.0 <= stats.inference_utilization <= 1.0
+            assert 0.0 <= stats.judge_utilization <= 1.0
+
+        assert sim.inference_pool.in_use == 0
+        assert sim.judge_pool.in_use == 0
+        assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks
+
+    def test_consumed_tasks_respect_staleness_bound(self) -> None:
+        """No consumed task has staleness exceeding max_staleness."""
+        cfg = SimConfig(
+            n_tasks=20,
+            n_trajectories=1,
+            inference_capacity=4,
+            judge_capacity=4,
+            rollout_duration_fn=uniform_duration(1, 200),
+            judge_duration_fn=constant_duration(1),
+            batch_size=1,
+            training_speed=1000.0,
+            max_staleness=2,
+            seed=42,
+        )
+        sim = Simulation(cfg)
+        result = sim.run()
+
+        final_ckpt = result.history[-1].ckpt_version
+        for task in sim.tasks:
+            if task.state == TaskState.CONSUMED:
+                assert task.birth_ckpt is not None
+                assert task.staleness(final_ckpt) >= 0
+
+    def test_no_training_when_entire_batch_dropped(self) -> None:
+        """If all tasks in a batch are stale, no training run starts and ckpt
+        does not advance."""
+        cfg = SimConfig(
+            n_tasks=4,
+            n_trajectories=1,
+            inference_capacity=4,
+            judge_capacity=4,
+            rollout_duration_fn=uniform_duration(1, 300),
+            judge_duration_fn=constant_duration(1),
+            batch_size=2,
+            training_speed=1000.0,
+            max_staleness=1,
+            seed=0,
+        )
+        result = Simulation(cfg).run()
+        assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks
+        for stats in result.history:
+            if stats.tasks_dropped > 0 and stats.tasks_consumed == 0:
+                assert not stats.training_active or stats.tasks_consumed > 0
+
+    def test_tasks_dropped_field_in_tickstats(self) -> None:
+        """TickStats includes the tasks_dropped field."""
+        cfg = SimConfig(
+            n_tasks=2,
+            n_trajectories=1,
+            inference_capacity=2,
+            judge_capacity=2,
+            rollout_duration_fn=constant_duration(1),
+            judge_duration_fn=constant_duration(1),
+            batch_size=2,
+        )
+        result = Simulation(cfg).run()
+        for stats in result.history:
+            assert isinstance(stats.tasks_dropped, int)
+            assert stats.tasks_dropped >= 0

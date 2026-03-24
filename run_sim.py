@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Run a default async-RL scheduling simulation and print a summary.
+"""Run an async-RL scheduling simulation and print a summary.
 
 Usage::
 
-    uv run run_sim.py
+    uv run run_sim.py                 # default config
+    uv run run_sim.py --adversarial   # high-variance config that triggers many drops
 """
 
 from __future__ import annotations
+
+import sys
 
 from async_gym.simulation import (
     SimConfig,
     SimResult,
     Simulation,
     TickStats,
+    constant_duration,
     describe_duration_fn,
     uniform_duration,
 )
@@ -35,6 +39,19 @@ CONFIG = SimConfig(
     seed=0,
 )
 
+ADVERSARIAL_CONFIG = SimConfig(
+    n_tasks=20,
+    n_trajectories=1,
+    inference_capacity=4,
+    judge_capacity=4,
+    rollout_duration_fn=uniform_duration(1, 200),
+    judge_duration_fn=constant_duration(1),
+    batch_size=1,
+    training_speed=1000.0,
+    max_staleness=2,
+    seed=42,
+)
+
 SNAPSHOT_INTERVAL = 10
 
 
@@ -49,6 +66,7 @@ _STATE_ORDER = [
     TaskState.JUDGING,
     TaskState.READY,
     TaskState.CONSUMED,
+    TaskState.DROPPED,
 ]
 
 
@@ -68,6 +86,7 @@ def _format_state_distribution(stats: TickStats) -> str:
         "JUDGING": "judging",
         "READY": "ready",
         "CONSUMED": "consumed",
+        "DROPPED": "dropped",
     }
     parts = []
     for state in _STATE_ORDER:
@@ -112,10 +131,10 @@ def _print_snapshots(history: list[TickStats], interval: int) -> None:
     print(
         f"\n{'Tick':>6}  {'Inf%':>5}  {'Jdg%':>5}  {'Trn%':>5}  {'TrnDur':>6}  "
         f"{'R_disp':>6}  {'J_disp':>6}  {'R_done':>6}  {'J_done':>6}  "
-        f"{'Ckpt':>4}  {'Buf':>3}  {'Stale':>5}  "
+        f"{'Ckpt':>4}  {'Buf':>3}  {'Stale':>5}  {'Drop':>4}  "
         f"State distribution"
     )
-    print("-" * 148)
+    print("-" * 156)
 
     for stats in history:
         is_periodic = stats.tick % interval == 0
@@ -137,6 +156,7 @@ def _print_snapshots(history: list[TickStats], interval: int) -> None:
             f"{stats.ckpt_version:>4}  "
             f"{stats.ready_buffer_size:>3}  "
             f"{stats.max_task_staleness:>5}  "
+            f"{stats.tasks_dropped:>4}  "
             f"{_format_state_distribution(stats)}"
         )
 
@@ -155,11 +175,14 @@ def _print_summary(result: SimResult) -> None:
     final_ckpt = result.history[-1].ckpt_version if result.history else 0
     peak_staleness = max(s.max_task_staleness for s in result.history) if result.history else 0
 
+    total_drops = result.tasks_dropped
+
     print("\n" + "=" * 120)
     print("Summary")
     print("=" * 120)
     print(f"  Ticks elapsed:        {result.ticks_elapsed}")
     print(f"  Tasks completed:      {result.tasks_completed}")
+    print(f"  Tasks dropped:        {total_drops}")
     print(f"  Final checkpoint:     {final_ckpt}")
     print(f"  Peak staleness:       {peak_staleness}")
     print(f"  Avg inference util:   {avg_inf:.1%}")
@@ -174,13 +197,17 @@ def _print_summary(result: SimResult) -> None:
 
 
 def main() -> None:
-    """Run the simulation with the default config and print results."""
-    _print_header(CONFIG)
+    """Run the simulation with the chosen config and print results."""
+    use_adversarial = "--adversarial" in sys.argv
+    cfg = ADVERSARIAL_CONFIG if use_adversarial else CONFIG
+    interval = 1 if use_adversarial else SNAPSHOT_INTERVAL
 
-    sim = Simulation(CONFIG)
+    _print_header(cfg)
+
+    sim = Simulation(cfg)
     result = sim.run()
 
-    _print_snapshots(result.history, SNAPSHOT_INTERVAL)
+    _print_snapshots(result.history, interval)
     _print_summary(result)
 
 

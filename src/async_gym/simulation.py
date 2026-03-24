@@ -187,6 +187,9 @@ class SimConfig:
 # ------------------------------------------------------------------
 
 
+_TERMINAL_STATES = frozenset({TaskState.CONSUMED, TaskState.DROPPED})
+
+
 @dataclass(frozen=True)
 class TickStats:
     """Snapshot of a single simulation tick.
@@ -198,6 +201,7 @@ class TickStats:
         rollouts_completed: Rollouts that finished this tick.
         judges_completed: Judges that finished this tick.
         tasks_consumed: Tasks that were consumed (moved to CONSUMED) this tick.
+        tasks_dropped: Tasks that were dropped (too stale) this tick.
         inference_utilization: Fraction of inference slots in use after dispatch.
         judge_utilization: Fraction of judge slots in use after dispatch.
         tasks_by_state: Count of tasks in each :class:`TaskState`.
@@ -209,7 +213,7 @@ class TickStats:
         ckpt_version: Global checkpoint version at the end of this tick.
         ready_buffer_size: Number of READY tasks waiting for training.
         max_task_staleness: Maximum staleness across all active (non-PENDING,
-            non-CONSUMED) tasks, or 0 if there are none.
+            non-CONSUMED, non-DROPPED) tasks, or 0 if there are none.
     """
 
     tick: int
@@ -218,6 +222,7 @@ class TickStats:
     rollouts_completed: int
     judges_completed: int
     tasks_consumed: int
+    tasks_dropped: int
     inference_utilization: float
     judge_utilization: float
     tasks_by_state: dict[TaskState, int]
@@ -236,11 +241,14 @@ class SimResult:
     Args:
         ticks_elapsed: Total ticks the simulation ran.
         tasks_completed: Number of tasks that reached ``CONSUMED``.
+        tasks_dropped: Number of tasks that were dropped (too stale at
+            consumption time).
         history: Per-tick :class:`TickStats` snapshots.
     """
 
     ticks_elapsed: int
     tasks_completed: int
+    tasks_dropped: int
     history: list[TickStats] = field(repr=False)
 
 
@@ -253,11 +261,12 @@ class Simulation:
     """Discrete-event simulation of the async RL scheduling pipeline.
 
     Creates all tasks up front and runs a five-phase dispatch loop until every
-    task is consumed or ``max_ticks`` is reached.  Training is batch-gated:
-    exactly ``batch_size`` READY tasks must accumulate before a training run
-    starts.  A pipeline-depth throttle limits the number of active tasks to
-    ``max_staleness * batch_size`` to guarantee no task is consumed with
-    staleness exceeding ``max_staleness``.
+    task is finished (consumed or dropped) or ``max_ticks`` is reached.
+    Training is batch-gated: ``batch_size`` READY tasks must accumulate before
+    a training run starts.  A pipeline-depth throttle limits the number of
+    active tasks to ``max_staleness * batch_size``.  At consumption time, any
+    task whose staleness exceeds ``max_staleness`` is dropped instead of
+    consumed.
 
     Args:
         config: Simulation parameters.
@@ -325,14 +334,15 @@ class Simulation:
         """Execute the simulation loop.
 
         Returns:
-            A :class:`SimResult` with the total ticks, tasks completed, and
-            per-tick history.
+            A :class:`SimResult` with the total ticks, tasks completed/dropped,
+            and per-tick history.
         """
         history: list[TickStats] = []
         tasks_completed = 0
+        tasks_dropped = 0
 
         for tick in range(self._config.max_ticks):
-            if tasks_completed == self._config.n_tasks:
+            if tasks_completed + tasks_dropped == self._config.n_tasks:
                 break
 
             # Phase 1 — dispatch (with staleness throttle)
@@ -348,9 +358,10 @@ class Simulation:
             # Phase 4 — collect newly-READY tasks into buffer
             self._collect_ready()
 
-            # Phase 5 — training gate
-            consumed_this_tick = self._maybe_start_training()
+            # Phase 5 — training gate (with staleness enforcement)
+            consumed_this_tick, dropped_this_tick = self._maybe_start_training()
             tasks_completed += consumed_this_tick
+            tasks_dropped += dropped_this_tick
 
             # Record stats
             state_counts: dict[TaskState, int] = dict(Counter(t.state for t in self._tasks))
@@ -366,6 +377,7 @@ class Simulation:
                     rollouts_completed=rollouts_completed,
                     judges_completed=judges_completed,
                     tasks_consumed=consumed_this_tick,
+                    tasks_dropped=dropped_this_tick,
                     inference_utilization=inference_util,
                     judge_utilization=judge_util,
                     tasks_by_state=state_counts,
@@ -381,6 +393,7 @@ class Simulation:
         return SimResult(
             ticks_elapsed=len(history),
             tasks_completed=tasks_completed,
+            tasks_dropped=tasks_dropped,
             history=history,
         )
 
@@ -391,10 +404,9 @@ class Simulation:
     def _dispatch_tick(self) -> tuple[int, int]:
         """Phase 1: dispatch rollouts and judges, throttled by staleness.
 
-        Active tasks (those with ``birth_ckpt`` set and not yet consumed) are
-        capped at ``max_staleness * batch_size`` to guarantee no task's
-        staleness exceeds ``max_staleness`` at consumption time.  PENDING tasks
-        are only promoted when room exists under this cap.
+        Active tasks (those with ``birth_ckpt`` set and not yet in a terminal
+        state) are capped at ``max_staleness * batch_size``.  PENDING tasks are
+        only promoted when room exists under this cap.
 
         Returns:
             ``(rollouts_dispatched, judges_dispatched)`` totals for this tick.
@@ -404,11 +416,11 @@ class Simulation:
         pipeline_cap = self._config.max_staleness * self._config.batch_size
 
         active_count = sum(
-            1 for t in self._tasks if t.birth_ckpt is not None and t.state != TaskState.CONSUMED
+            1 for t in self._tasks if t.birth_ckpt is not None and t.state not in _TERMINAL_STATES
         )
 
         for task in self._tasks:
-            if task.state == TaskState.CONSUMED:
+            if task.state in _TERMINAL_STATES:
                 continue
 
             is_pending = task.birth_ckpt is None
@@ -448,7 +460,7 @@ class Simulation:
         total_judges = 0
 
         for task in self._tasks:
-            if task.state == TaskState.CONSUMED:
+            if task.state in _TERMINAL_STATES:
                 continue
             if task.birth_ckpt is None:
                 continue
@@ -483,38 +495,47 @@ class Simulation:
             if task.state == TaskState.READY and task.task_id not in buffered_ids:
                 self._ready_buffer.append(task)
 
-    def _maybe_start_training(self) -> int:
+    def _maybe_start_training(self) -> tuple[int, int]:
         """Phase 5: start a training run if the batch is full and trainer idle.
 
-        Consumes exactly ``batch_size`` tasks from the front of the ready
-        buffer, computes a training duration, and creates an :class:`InFlight`
-        for the training run.
+        Pops ``batch_size`` tasks from the front of the ready buffer.  Each
+        task's staleness is checked: tasks exceeding ``max_staleness`` are
+        dropped, the rest are consumed.  Training starts only if at least one
+        task was consumed.
 
         Returns:
-            Number of tasks consumed this tick (0 or ``batch_size``).
+            ``(consumed, dropped)`` counts for this tick.
         """
         cfg = self._config
         if self._training_in_flight is not None:
-            return 0
+            return 0, 0
         if len(self._ready_buffer) < cfg.batch_size:
-            return 0
+            return 0, 0
 
         batch = self._ready_buffer[: cfg.batch_size]
         self._ready_buffer = self._ready_buffer[cfg.batch_size :]
 
+        consumed = 0
+        dropped = 0
         for task in batch:
-            task.consume()
+            if task.staleness(self._ckpt_version) > cfg.max_staleness:
+                task.drop()
+                dropped += 1
+            else:
+                task.consume()
+                consumed += 1
 
-        sampled_duration = cfg.rollout_duration_fn(1, self._rng)[0]
-        training_ticks = max(
-            1,
-            math.ceil(
-                sampled_duration * cfg.n_trajectories * cfg.batch_size * 3 / cfg.training_speed
-            ),
-        )
-        self._training_in_flight = InFlight(total_ticks=training_ticks)
+        if consumed > 0:
+            sampled_duration = cfg.rollout_duration_fn(1, self._rng)[0]
+            training_ticks = max(
+                1,
+                math.ceil(
+                    sampled_duration * cfg.n_trajectories * cfg.batch_size * 3 / cfg.training_speed
+                ),
+            )
+            self._training_in_flight = InFlight(total_ticks=training_ticks)
 
-        return len(batch)
+        return consumed, dropped
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -528,7 +549,7 @@ class Simulation:
         """
         worst = 0
         for task in self._tasks:
-            if task.birth_ckpt is not None and task.state != TaskState.CONSUMED:
+            if task.birth_ckpt is not None and task.state not in _TERMINAL_STATES:
                 worst = max(worst, task.staleness(self._ckpt_version))
         return worst
 

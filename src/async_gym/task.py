@@ -22,9 +22,13 @@ __all__ = ["TaskState", "Task", "InFlight", "TickResult"]
 class TaskState(Enum):
     """Observable lifecycle state of an RL task.
 
-    The ordering follows the natural pipeline progression:
+    The ordering follows the natural pipeline progression::
 
         PENDING → ROLLING_OUT → PARTIAL → JUDGING → READY → CONSUMED
+                                                           ↘ DROPPED
+
+    Tasks that exceed the staleness bound at consumption time are moved to
+    ``DROPPED`` instead of ``CONSUMED``.
     """
 
     PENDING = auto()
@@ -33,6 +37,7 @@ class TaskState(Enum):
     JUDGING = auto()
     READY = auto()
     CONSUMED = auto()
+    DROPPED = auto()
 
 
 @dataclass
@@ -131,6 +136,7 @@ class Task:
     judged: int = field(init=False, default=0)
 
     _consumed: bool = field(init=False, default=False, repr=False)
+    _dropped: bool = field(init=False, default=False, repr=False)
     birth_ckpt: int | None = field(init=False, default=None, repr=False)
 
     _VALID_N_RANGE: ClassVar[range] = range(1, 10_001)
@@ -202,6 +208,8 @@ class Task:
         """
         if self._consumed:
             return TaskState.CONSUMED
+        if self._dropped:
+            return TaskState.DROPPED
         if self.judged == self.n_trajectories:
             return TaskState.READY
 
@@ -251,10 +259,10 @@ class Task:
                 determines how many trajectories are moved.
 
         Raises:
-            ValueError: If the task is consumed, *durations* is empty, or there
-                are not enough pending trajectories.
+            ValueError: If the task is consumed or dropped, *durations* is
+                empty, or there are not enough pending trajectories.
         """
-        self._check_not_consumed("submit_rollouts")
+        self._check_not_terminal("submit_rollouts")
         k = len(durations)
         if k == 0:
             raise ValueError("durations must be non-empty")
@@ -274,10 +282,10 @@ class Task:
                 judging.  Length determines how many trajectories are moved.
 
         Raises:
-            ValueError: If the task is consumed, *durations* is empty, or there
-                are not enough pending-judge trajectories.
+            ValueError: If the task is consumed or dropped, *durations* is
+                empty, or there are not enough pending-judge trajectories.
         """
-        self._check_not_consumed("submit_judges")
+        self._check_not_terminal("submit_judges")
         k = len(durations)
         if k == 0:
             raise ValueError("durations must be non-empty")
@@ -297,9 +305,9 @@ class Task:
             A :class:`TickResult` summarising how many items completed.
 
         Raises:
-            ValueError: If the task has been consumed.
+            ValueError: If the task has been consumed or dropped.
         """
-        self._check_not_consumed("tick")
+        self._check_not_terminal("tick")
 
         # Tick all rollouts and partition into done / still going.
         rollouts_completed = 0
@@ -344,18 +352,35 @@ class Task:
             )
         self._consumed = True
 
+    def drop(self) -> None:
+        """Mark the task as dropped due to exceeding the staleness bound.
+
+        A dropped task is a terminal state — its data was too stale to be
+        useful for training, so it is discarded instead of consumed.
+
+        Raises:
+            ValueError: If the task is not in the ``READY`` state.
+        """
+        if self.state != TaskState.READY:
+            raise ValueError(
+                f"Cannot drop task {self.task_id!r} in state {self.state.name}; task must be READY"
+            )
+        self._dropped = True
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _check_not_consumed(self, method: str) -> None:
-        """Raise if the task has already been consumed.
+    def _check_not_terminal(self, method: str) -> None:
+        """Raise if the task has already reached a terminal state.
 
         Args:
             method: Name of the calling method (for the error message).
 
         Raises:
-            ValueError: If the task is in ``CONSUMED`` state.
+            ValueError: If the task is ``CONSUMED`` or ``DROPPED``.
         """
         if self._consumed:
             raise ValueError(f"Cannot call {method}() on consumed task {self.task_id!r}")
+        if self._dropped:
+            raise ValueError(f"Cannot call {method}() on dropped task {self.task_id!r}")

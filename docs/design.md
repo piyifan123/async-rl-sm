@@ -95,6 +95,7 @@ The task-level state is a pure function of the counters / list lengths:
 | State | Condition (evaluated top-to-bottom, first match wins) |
 |---|---|
 | `CONSUMED` | Explicit flag set after trainer consumption. |
+| `DROPPED` | Explicit flag set when staleness exceeds `max_staleness` at consumption time. |
 | `READY` | `judged == N` |
 | `JUDGING` | `pending_rollout == 0 and rolling_out == 0` and judge pipeline has remaining work (`pending_judge > 0 or judging > 0`) |
 | `PARTIAL` | Both rollout and judge pipelines have work: `(pending_rollout > 0 or rolling_out > 0)` **and** `(pending_judge > 0 or judging > 0 or judged > 0)` |
@@ -116,6 +117,7 @@ The scheduler drives the task forward through two mechanisms:
 | `submit_rollouts(durations)` | `pending_rollout → rolling_out` | Dispatches `len(durations)` trajectories to inference replicas. Each duration (in ticks) is assigned to one `InFlight` item. |
 | `submit_judges(durations)` | `pending_judge → judging` | Dispatches `len(durations)` trajectories to judge replicas. Each duration is assigned to one `InFlight` item. |
 | `consume()` | (sets consumed flag) | Trainer marks the task as consumed (requires `READY`). |
+| `drop()` | (sets dropped flag) | Scheduler marks the task as dropped due to exceeding the staleness bound (requires `READY`). |
 
 #### Tick-driven completion
 
@@ -427,24 +429,70 @@ generated.  Higher staleness means the training data is further off-policy.
 
 ### 5.5 Pipeline-depth throttle
 
-To guarantee that no task is consumed with staleness exceeding `max_staleness`,
-the scheduler limits the number of **active** tasks (those with `birth_ckpt`
-set and not yet CONSUMED) to:
+To limit staleness the scheduler caps the number of **active** tasks (those
+with `birth_ckpt` set and not yet in a terminal state) to:
 
 ```
 pipeline_cap = max_staleness * batch_size
 ```
 
-The reasoning: each training run consumes exactly `batch_size` tasks and
-increments the checkpoint by 1.  If at most `max_staleness * batch_size` tasks
-are active, then the oldest active task can be at most `max_staleness` training
-runs away from consumption.
-
 During dispatch (Phase 1), PENDING tasks are only promoted when the active
 count is below this cap.  Tasks already in the pipeline continue to receive
 rollout/judge dispatches regardless.
 
-### 5.6 Worked example
+**Important limitation:** the pipeline-depth throttle bounds *concurrency* but
+does not by itself guarantee that no task exceeds the staleness bound.  With
+variable rollout durations a slow task can hold one active slot while faster
+tasks cycle through the remaining slots, each advancing the checkpoint.  By the
+time the slow task finally reaches READY its `birth_ckpt` may be far behind
+`ckpt_version`.  See §5.7 for how this is handled.
+
+### 5.6 Staleness enforcement at consumption (task dropping)
+
+To enforce the invariant that **no consumed task has
+`ckpt_version - birth_ckpt > max_staleness`**, the training gate (Phase 5)
+checks each task's staleness at consumption time:
+
+1. `batch_size` tasks are popped from the front of the READY buffer.
+2. For each task:
+   - If `task.staleness(ckpt_version) > max_staleness` → the task is **dropped**
+     (moved to the terminal `DROPPED` state).
+   - Otherwise → the task is **consumed** normally.
+3. Training starts only if at least one task was consumed.  If the entire batch
+   is dropped no training run begins and `ckpt_version` does not advance.
+
+Dropped tasks are terminal — they free their active-count slot but their
+rollout/judge work is wasted.
+
+The `DROPPED` state is tracked in `TaskState.DROPPED`.  Per-tick drop counts
+appear in `TickStats.tasks_dropped` and the simulation-wide total in
+`SimResult.tasks_dropped`.
+
+The simulation terminates when
+`tasks_completed + tasks_dropped == n_tasks`.
+
+### 5.7 Pipeline-cap flaw and adversarial scenario
+
+The pipeline-depth cap assumes tasks drain in roughly the order they were born.
+With variable durations this assumption breaks:
+
+**Configuration:** `batch_size=1, max_staleness=2, pipeline_cap=2`.
+Rollout durations sampled from `uniform(1, 200)`, training ~1 tick.
+
+| Phase | What happens | ckpt |
+|-------|-------------|------|
+| Fill  | T0 (dur=150), T1 (dur=3) promoted, both `birth_ckpt=0` | 0 |
+| ~4    | T1 finishes → READY → consumed, training starts (1 tick) | 0 |
+| ~5    | Training done, **ckpt→1**. Slot opens, T2 promoted (`birth_ckpt=1`). | 1 |
+| ~8    | T2 finishes → consumed, **ckpt→2**. T3 promoted (`birth_ckpt=2`). | 2 |
+| ...   | Fast tasks keep cycling, each advancing ckpt. | climbing |
+| ~150  | T0 finally finishes. `staleness = ckpt - 0 ≫ 2` → **dropped**. | ~50 |
+
+With `seed=42` and 20 tasks, this configuration produces 3 dropped tasks out
+of 20 (15% wasted compute).  The drop mechanism prevents stale data from
+entering training while making the waste visible in metrics.
+
+### 5.8 Worked example (constant durations, no drops)
 
 Configuration: `batch_size=4, max_staleness=2`, pipeline cap = 8.
 
@@ -456,4 +504,4 @@ Configuration: `batch_size=4, max_staleness=2`, pipeline cap = 8.
 4. Oldest active tasks have staleness = 1 - 0 = 1 <= 2.
 5. Next training: consumes 4 more, ckpt=2.  Dispatch 4 more (birth_ckpt=2).
 6. All tasks born at ckpt 0 are consumed before ckpt reaches 3, so staleness
-   never exceeds 2.
+   never exceeds 2 and no tasks are dropped.
