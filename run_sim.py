@@ -215,12 +215,12 @@ def _run_scenario(scenario: Scenario, scheduler: Scheduler) -> None:
     """
     from async_gym.simulation import Simulation
 
-    _print_header(scenario, scheduler)
-
     sim = Simulation(scenario.config, scheduler=scheduler)
     result = sim.run()
 
     _print_snapshots(result.history, scenario.snapshot_interval)
+    print()
+    _print_header(scenario, scheduler)
     _print_summary(result)
 
 
