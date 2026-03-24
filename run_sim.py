@@ -3,11 +3,13 @@
 
 Usage::
 
-    uv run run_sim.py                                # run "default" scenario
-    uv run run_sim.py --scenario adversarial         # run one scenario by name
-    uv run run_sim.py --scenario default adversarial # run several by name
-    uv run run_sim.py --all                          # run all registered scenarios
-    uv run run_sim.py --list                         # list available scenarios and exit
+    uv run run_sim.py                                        # default scenario, greedy-fifo
+    uv run run_sim.py --scenario adversarial                 # one scenario by name
+    uv run run_sim.py --scenario default adversarial         # several scenarios
+    uv run run_sim.py --all                                  # all registered scenarios
+    uv run run_sim.py --scheduler greedy-fifo                # specify scheduler by name
+    uv run run_sim.py --list                                 # list scenarios and exit
+    uv run run_sim.py --list-schedulers                      # list schedulers and exit
 """
 
 from __future__ import annotations
@@ -17,12 +19,42 @@ import sys
 import textwrap
 
 from async_gym.scenarios import Scenario, get_scenario, list_scenarios
+from async_gym.scheduler import GreedyFIFOScheduler, Scheduler
 from async_gym.simulation import (
     SimResult,
     TickStats,
     describe_duration_fn,
 )
 from async_gym.task import TaskState
+
+# ------------------------------------------------------------------
+# Scheduler registry (name -> factory)
+# ------------------------------------------------------------------
+
+SCHEDULERS: dict[str, type[Scheduler]] = {
+    "greedy-fifo": GreedyFIFOScheduler,
+}
+
+
+def _get_scheduler(name: str) -> Scheduler:
+    """Look up a scheduler by name and return a fresh instance.
+
+    Args:
+        name: Scheduler name (case-sensitive).
+
+    Returns:
+        A new :class:`Scheduler` instance.
+
+    Raises:
+        KeyError: If *name* is not registered.
+    """
+    try:
+        cls = SCHEDULERS[name]
+    except KeyError:
+        available = ", ".join(sorted(SCHEDULERS))
+        raise KeyError(f"unknown scheduler {name!r}; available: {available}") from None
+    return cls()
+
 
 # ------------------------------------------------------------------
 # Formatting helpers
@@ -64,15 +96,16 @@ def _format_state_distribution(stats: TickStats) -> str:
     return "  ".join(parts)
 
 
-def _print_header(scenario: Scenario) -> None:
+def _print_header(scenario: Scenario, scheduler: Scheduler) -> None:
     """Print the scenario description and simulation configuration header.
 
     Args:
         scenario: The scenario to display.
+        scheduler: The scheduler being used.
     """
     cfg = scenario.config
     print("=" * 120)
-    print(f"Scenario: {scenario.name}")
+    print(f"Scenario: {scenario.name}  |  Scheduler: {scheduler.name}")
     wrapped = textwrap.fill(scenario.description, width=114)
     for line in wrapped.splitlines():
         print(f"  {line}")
@@ -93,6 +126,7 @@ def _print_header(scenario: Scenario) -> None:
     print(f"  Max staleness:        {cfg.max_staleness}")
     print(f"  Max ticks:            {cfg.max_ticks}")
     print(f"  Seed:                 {cfg.seed}")
+    print(f"  Scheduler:            {scheduler.name}")
     print("-" * 120)
 
 
@@ -171,17 +205,18 @@ def _print_summary(result: SimResult) -> None:
     print("=" * 120)
 
 
-def _run_scenario(scenario: Scenario) -> None:
+def _run_scenario(scenario: Scenario, scheduler: Scheduler) -> None:
     """Run a single scenario and print its full output.
 
     Args:
         scenario: The scenario to execute.
+        scheduler: The scheduler to use for dispatch decisions.
     """
     from async_gym.simulation import Simulation
 
-    _print_header(scenario)
+    _print_header(scenario, scheduler)
 
-    sim = Simulation(scenario.config)
+    sim = Simulation(scenario.config, scheduler=scheduler)
     result = sim.run()
 
     _print_snapshots(result.history, scenario.snapshot_interval)
@@ -201,6 +236,14 @@ def _list_scenarios() -> None:
 # ------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------
+
+
+def _list_schedulers() -> None:
+    """Print a table of all registered schedulers and exit."""
+    print(f"{'Name':<20}  Class")
+    print("-" * 60)
+    for name, cls in SCHEDULERS.items():
+        print(f"{name:<20}  {cls.__module__}.{cls.__qualname__}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -231,6 +274,18 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="list_scenarios",
         help="List available scenarios and exit.",
     )
+    group.add_argument(
+        "--list-schedulers",
+        action="store_true",
+        dest="list_schedulers",
+        help="List available schedulers and exit.",
+    )
+    parser.add_argument(
+        "--scheduler",
+        metavar="NAME",
+        default="greedy-fifo",
+        help="Scheduler algorithm to use (default: 'greedy-fifo').",
+    )
     return parser
 
 
@@ -242,6 +297,15 @@ def main() -> None:
     if args.list_scenarios:
         _list_scenarios()
         sys.exit(0)
+
+    if args.list_schedulers:
+        _list_schedulers()
+        sys.exit(0)
+
+    try:
+        scheduler = _get_scheduler(args.scheduler)
+    except KeyError as exc:
+        parser.error(str(exc))
 
     if args.run_all:
         scenarios = list_scenarios()
@@ -258,7 +322,7 @@ def main() -> None:
     for i, scenario in enumerate(scenarios):
         if i > 0:
             print("\n\n")
-        _run_scenario(scenario)
+        _run_scenario(scenario, scheduler)
 
 
 if __name__ == "__main__":

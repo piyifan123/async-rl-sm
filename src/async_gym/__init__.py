@@ -2,6 +2,12 @@
 
 from async_gym.replica_pool import ReplicaPool
 from async_gym.scenarios import Scenario, get_scenario, list_scenarios
+from async_gym.scheduler import (
+    DispatchAction,
+    GreedyFIFOScheduler,
+    Scheduler,
+    SchedulerView,
+)
 from async_gym.simulation import (
     SimConfig,
     SimResult,
@@ -14,9 +20,13 @@ from async_gym.simulation import (
 from async_gym.task import InFlight, Task, TaskState, TickResult
 
 __all__: list[str] = [
+    "DispatchAction",
+    "GreedyFIFOScheduler",
     "InFlight",
     "ReplicaPool",
     "Scenario",
+    "Scheduler",
+    "SchedulerView",
     "SimConfig",
     "SimResult",
     "Simulation",

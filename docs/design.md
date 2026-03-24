@@ -377,8 +377,9 @@ uv run run_sim.py
 
 - **All tasks created at tick 0** — simplest starting point; arrival
   scheduling is a future extension.
-- **Greedy dispatch order** — tasks are visited in creation order; a priority
-  policy (e.g. closest-to-completion first) can be swapped in later.
+- **Pluggable dispatch scheduling** — dispatch decisions (admission, rollout
+  allocation, judge allocation) are delegated to a `Scheduler` interface.
+  See §6 for details.
 - **No async / no threads** — the loop is pure synchronous discrete-event
   simulation.  "Async" in the project name refers to the RL pipeline model,
   not Python coroutines.
@@ -505,3 +506,137 @@ Configuration: `batch_size=4, max_staleness=2`, pipeline cap = 8.
 5. Next training: consumes 4 more, ckpt=2.  Dispatch 4 more (birth_ckpt=2).
 6. All tasks born at ckpt 0 are consumed before ckpt reaches 3, so staleness
    never exceeds 2 and no tasks are dropped.
+
+---
+
+## 6. Pluggable Dispatch Scheduler
+
+### 6.1 Motivation
+
+Phase 1 (Dispatch) of each tick makes three decisions:
+
+1. **Admission** — should a PENDING task enter the active pipeline?
+2. **Rollout allocation** — how many inference slots does each active task get?
+3. **Judge allocation** — how many judge slots does each active task get?
+
+These are the degrees of freedom that meaningfully affect throughput, staleness,
+and drop rates.  The `Scheduler` ABC exposes each as an overridable hook so
+that alternative strategies can be implemented and compared against a common
+simulation harness.
+
+### 6.2 Interface
+
+```python
+class Scheduler(ABC):
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @abstractmethod
+    def should_admit(self, task, active_count, view) -> bool: ...
+
+    @abstractmethod
+    def plan_rollout_dispatch(self, tasks, view) -> Sequence[DispatchAction]: ...
+
+    @abstractmethod
+    def plan_judge_dispatch(self, tasks, view) -> Sequence[DispatchAction]: ...
+```
+
+Supporting types:
+
+- **`SchedulerView`** — frozen dataclass providing a read-only snapshot of
+  simulation state (tick, checkpoint version, pool availability/capacity,
+  active count, pipeline cap, batch size, staleness limit, training status,
+  ready buffer size).
+- **`DispatchAction(task, count)`** — frozen dataclass pairing a task with a
+  slot count.
+
+### 6.3 Hook contracts
+
+**`should_admit(task, active_count, view) -> bool`**
+
+Called once per PENDING task in creation order during the admission phase.
+`active_count` is a live value — updated by the simulation as tasks are
+admitted within the same tick.  If the hook returns `True` the simulation
+sets `task.birth_ckpt = ckpt_version`.
+
+**`plan_rollout_dispatch(tasks, view) -> Sequence[DispatchAction]`**
+
+Called after admission.  The returned list order IS the dispatch priority.
+Each action specifies how many inference slots to give a task.
+
+Constraints validated by the simulation:
+
+- `sum(a.count) <= view.inference_available`
+- Per action: `1 <= a.count <= task.pending_rollout`
+- Only non-terminal tasks with `birth_ckpt` set
+
+**`plan_judge_dispatch(tasks, view) -> Sequence[DispatchAction]`**
+
+Same contract as rollout dispatch, but for judge slots
+(`sum(a.count) <= view.judge_available`, `a.count <= task.pending_judge`).
+
+Both dispatch methods receive the **same** `SchedulerView` snapshot
+(simultaneous, no dependency between them).
+
+### 6.4 Simulation flow per tick
+
+```
+Build SchedulerView snapshot
+         │
+         ▼
+┌─ Admission phase ──────────────────────────┐
+│ For each PENDING task (creation order):     │
+│   call should_admit(task, active_count, view)│
+│   if yes → set birth_ckpt, active_count++  │
+└─────────────────────────────────────────────┘
+         │
+         ▼
+┌─ Dispatch phase ───────────────────────────┐
+│ plan_rollout_dispatch(tasks, view) ──┐     │
+│ plan_judge_dispatch(tasks, view)  ───┘     │
+│           same view, simultaneous          │
+│                                            │
+│ Validate both plans                        │
+│ Execute: durations, submit, pool acquire   │
+└────────────────────────────────────────────┘
+```
+
+### 6.5 Baseline: `GreedyFIFOScheduler`
+
+Replicates the original hard-coded behaviour:
+
+| Hook | Behaviour |
+|------|-----------|
+| `should_admit` | `active_count < pipeline_cap` |
+| `plan_rollout_dispatch` | Iterate in creation order; each task gets `min(pending_rollout, remaining_slots)` |
+| `plan_judge_dispatch` | Iterate in creation order; each task gets `min(pending_judge, remaining_slots)` |
+
+### 6.6 Scheduler lives on `Simulation`, not `SimConfig`
+
+`SimConfig` describes the **environment** — tasks, capacities, durations.
+The scheduler is the **policy** being evaluated.  This separation makes
+comparison natural:
+
+```python
+config = get_scenario("default").config
+for sched in [GreedyFIFOScheduler(), MyCustomScheduler()]:
+    result = Simulation(config, scheduler=sched).run()
+```
+
+If no scheduler is passed, `Simulation` defaults to `GreedyFIFOScheduler()`.
+
+### 6.7 Implementing a custom scheduler
+
+Subclass `Scheduler` and implement the three abstract methods, or subclass
+`GreedyFIFOScheduler` to override only the hooks you want to change.
+
+Example strategies:
+
+- **Completion-priority** — sort tasks by fewest remaining rollouts/judges,
+  so near-complete tasks reach READY faster and fill training batches sooner.
+- **Fair-share** — spread slots evenly across active tasks instead of greedy
+  first-come-first-served.
+- **Back-pressure** — tighten admission (e.g. also require
+  `not view.training_in_flight` or `view.ready_buffer_size < batch_size`)
+  to avoid wasting compute on tasks that will go stale.

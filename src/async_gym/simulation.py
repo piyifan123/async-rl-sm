@@ -1,11 +1,12 @@
 """Discrete-event simulation runner for the async RL scheduling pipeline.
 
 Orchestrates :class:`Task` state machines and :class:`ReplicaPool` capacity
-constraints through a greedy dispatch loop.  Each simulation tick follows five
-phases:
+constraints through a pluggable dispatch scheduler.  Each simulation tick
+follows five phases:
 
-1. **Dispatch** — greedily submit rollouts and judges for active tasks, bounded
-   by pool capacity and a pipeline-depth throttle for staleness control.
+1. **Dispatch** — the :class:`~async_gym.scheduler.Scheduler` admits PENDING
+   tasks, then plans rollout and judge slot allocation.  The simulation
+   validates and executes the plan.
 2. **Record utilisation** — snapshot pool occupancy after dispatch.
 3. **Advance** — tick all in-flight task work *and* any in-progress training,
    releasing pool slots for completed items and incrementing the global
@@ -22,12 +23,18 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from async_gym.replica_pool import ReplicaPool
+from async_gym.scheduler import (
+    DispatchAction,
+    GreedyFIFOScheduler,
+    Scheduler,
+    SchedulerView,
+)
 from async_gym.task import InFlight, Task, TaskState
 
 __all__ = [
@@ -268,8 +275,14 @@ class Simulation:
     task whose staleness exceeds ``max_staleness`` is dropped instead of
     consumed.
 
+    Dispatch scheduling is delegated to a :class:`~async_gym.scheduler.Scheduler`
+    instance, which controls admission, rollout allocation, and judge allocation
+    each tick.  The default is :class:`~async_gym.scheduler.GreedyFIFOScheduler`.
+
     Args:
         config: Simulation parameters.
+        scheduler: Dispatch scheduler.  Defaults to
+            :class:`~async_gym.scheduler.GreedyFIFOScheduler`.
 
     Examples:
         >>> cfg = SimConfig(
@@ -285,8 +298,9 @@ class Simulation:
         2
     """
 
-    def __init__(self, config: SimConfig) -> None:
+    def __init__(self, config: SimConfig, scheduler: Scheduler | None = None) -> None:
         self._config = config
+        self._scheduler = scheduler or GreedyFIFOScheduler()
         self._rng = np.random.default_rng(config.seed)
 
         self._inference_pool = ReplicaPool(name="inference", capacity=config.inference_capacity)
@@ -298,6 +312,7 @@ class Simulation:
         ]
 
         self._ckpt_version: int = 0
+        self._current_tick: int = 0
         self._training_in_flight: InFlight | None = None
         self._ready_buffer: list[Task] = []
 
@@ -309,6 +324,11 @@ class Simulation:
     def config(self) -> SimConfig:
         """The simulation configuration."""
         return self._config
+
+    @property
+    def scheduler(self) -> Scheduler:
+        """The dispatch scheduler."""
+        return self._scheduler
 
     @property
     def tasks(self) -> list[Task]:
@@ -345,7 +365,9 @@ class Simulation:
             if tasks_completed + tasks_dropped == self._config.n_tasks:
                 break
 
-            # Phase 1 — dispatch (with staleness throttle)
+            self._current_tick = tick
+
+            # Phase 1 — dispatch via scheduler
             rollouts_dispatched, judges_dispatched = self._dispatch_tick()
 
             # Phase 2 — record utilisation
@@ -402,50 +424,173 @@ class Simulation:
     # ------------------------------------------------------------------
 
     def _dispatch_tick(self) -> tuple[int, int]:
-        """Phase 1: dispatch rollouts and judges, throttled by staleness.
+        """Phase 1: dispatch rollouts and judges via the scheduler.
 
-        Active tasks (those with ``birth_ckpt`` set and not yet in a terminal
-        state) are capped at ``max_staleness * batch_size``.  PENDING tasks are
-        only promoted when room exists under this cap.
+        Builds a :class:`SchedulerView`, runs the admission phase, then asks
+        the scheduler for rollout and judge allocation plans.  Plans are
+        validated and executed.
 
         Returns:
             ``(rollouts_dispatched, judges_dispatched)`` totals for this tick.
         """
-        total_rollouts = 0
-        total_judges = 0
-        pipeline_cap = self._config.max_staleness * self._config.batch_size
+        view = self._build_scheduler_view()
 
-        active_count = sum(
-            1 for t in self._tasks if t.birth_ckpt is not None and t.state not in _TERMINAL_STATES
-        )
-
+        # --- Admission phase ---
+        active_count = view.active_count
         for task in self._tasks:
-            if task.state in _TERMINAL_STATES:
+            if task.birth_ckpt is not None or task.state in _TERMINAL_STATES:
                 continue
+            if self._scheduler.should_admit(task, active_count, view):
+                task.birth_ckpt = self._ckpt_version
+                active_count += 1
 
-            is_pending = task.birth_ckpt is None
-            if is_pending and active_count >= pipeline_cap:
-                continue
+        # --- Dispatch phase (both plans from the same snapshot) ---
+        rollout_plan = self._scheduler.plan_rollout_dispatch(self._tasks, view)
+        judge_plan = self._scheduler.plan_judge_dispatch(self._tasks, view)
 
-            can_rollout = min(task.pending_rollout, self._inference_pool.available)
-            if can_rollout > 0:
-                if is_pending:
-                    task.birth_ckpt = self._ckpt_version
-                    active_count += 1
+        self._validate_rollout_plan(rollout_plan, view)
+        self._validate_judge_plan(judge_plan, view)
 
-                durations = self._config.rollout_duration_fn(can_rollout, self._rng)
-                task.submit_rollouts(durations)
-                self._inference_pool.acquire(can_rollout)
-                total_rollouts += can_rollout
-
-            can_judge = min(task.pending_judge, self._judge_pool.available)
-            if can_judge > 0:
-                durations = self._config.judge_duration_fn(can_judge, self._rng)
-                task.submit_judges(durations)
-                self._judge_pool.acquire(can_judge)
-                total_judges += can_judge
+        total_rollouts = self._execute_rollout_plan(rollout_plan)
+        total_judges = self._execute_judge_plan(judge_plan)
 
         return total_rollouts, total_judges
+
+    def _build_scheduler_view(self) -> SchedulerView:
+        """Create a read-only snapshot of current simulation state.
+
+        Returns:
+            A frozen :class:`SchedulerView` for the scheduler hooks.
+        """
+        cfg = self._config
+        active = sum(
+            1 for t in self._tasks if t.birth_ckpt is not None and t.state not in _TERMINAL_STATES
+        )
+        return SchedulerView(
+            tick=self._current_tick,
+            ckpt_version=self._ckpt_version,
+            inference_available=self._inference_pool.available,
+            inference_capacity=self._inference_pool.capacity,
+            judge_available=self._judge_pool.available,
+            judge_capacity=self._judge_pool.capacity,
+            active_count=active,
+            pipeline_cap=cfg.max_staleness * cfg.batch_size,
+            batch_size=cfg.batch_size,
+            max_staleness=cfg.max_staleness,
+            training_in_flight=self._training_in_flight is not None,
+            ready_buffer_size=len(self._ready_buffer),
+        )
+
+    def _validate_rollout_plan(
+        self,
+        actions: Sequence[DispatchAction],
+        view: SchedulerView,
+    ) -> None:
+        """Raise if the rollout plan violates capacity or per-task constraints.
+
+        Args:
+            actions: Rollout dispatch actions from the scheduler.
+            view: The scheduler view snapshot used for planning.
+
+        Raises:
+            ValueError: On any constraint violation.
+        """
+        total = 0
+        for action in actions:
+            task = action.task
+            if task.state in _TERMINAL_STATES:
+                raise ValueError(
+                    f"Rollout plan includes terminal task {task.task_id!r} "
+                    f"(state={task.state.name})"
+                )
+            if task.birth_ckpt is None:
+                raise ValueError(f"Rollout plan includes non-admitted task {task.task_id!r}")
+            if action.count < 1:
+                raise ValueError(
+                    f"Rollout action for {task.task_id!r} has count={action.count}; must be >= 1"
+                )
+            if action.count > task.pending_rollout:
+                raise ValueError(
+                    f"Rollout action for {task.task_id!r}: count={action.count} "
+                    f"exceeds pending_rollout={task.pending_rollout}"
+                )
+            total += action.count
+        if total > view.inference_available:
+            raise ValueError(
+                f"Rollout plan total={total} exceeds inference_available={view.inference_available}"
+            )
+
+    def _validate_judge_plan(
+        self,
+        actions: Sequence[DispatchAction],
+        view: SchedulerView,
+    ) -> None:
+        """Raise if the judge plan violates capacity or per-task constraints.
+
+        Args:
+            actions: Judge dispatch actions from the scheduler.
+            view: The scheduler view snapshot used for planning.
+
+        Raises:
+            ValueError: On any constraint violation.
+        """
+        total = 0
+        for action in actions:
+            task = action.task
+            if task.state in _TERMINAL_STATES:
+                raise ValueError(
+                    f"Judge plan includes terminal task {task.task_id!r} (state={task.state.name})"
+                )
+            if task.birth_ckpt is None:
+                raise ValueError(f"Judge plan includes non-admitted task {task.task_id!r}")
+            if action.count < 1:
+                raise ValueError(
+                    f"Judge action for {task.task_id!r} has count={action.count}; must be >= 1"
+                )
+            if action.count > task.pending_judge:
+                raise ValueError(
+                    f"Judge action for {task.task_id!r}: count={action.count} "
+                    f"exceeds pending_judge={task.pending_judge}"
+                )
+            total += action.count
+        if total > view.judge_available:
+            raise ValueError(
+                f"Judge plan total={total} exceeds judge_available={view.judge_available}"
+            )
+
+    def _execute_rollout_plan(self, actions: Sequence[DispatchAction]) -> int:
+        """Execute validated rollout dispatch actions.
+
+        Args:
+            actions: Validated rollout dispatch actions.
+
+        Returns:
+            Total rollout slots dispatched.
+        """
+        total = 0
+        for action in actions:
+            durations = self._config.rollout_duration_fn(action.count, self._rng)
+            action.task.submit_rollouts(durations)
+            self._inference_pool.acquire(action.count)
+            total += action.count
+        return total
+
+    def _execute_judge_plan(self, actions: Sequence[DispatchAction]) -> int:
+        """Execute validated judge dispatch actions.
+
+        Args:
+            actions: Validated judge dispatch actions.
+
+        Returns:
+            Total judge slots dispatched.
+        """
+        total = 0
+        for action in actions:
+            durations = self._config.judge_duration_fn(action.count, self._rng)
+            action.task.submit_judges(durations)
+            self._judge_pool.acquire(action.count)
+            total += action.count
+        return total
 
     def _advance_tick(self) -> tuple[int, int]:
         """Phase 3: tick all active tasks and training, release pool slots.
