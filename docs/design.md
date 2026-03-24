@@ -269,3 +269,94 @@ for task in active_tasks:
   judge replicas (different `capacity`, same logic).
 - **Testable independently** — pool logic has its own unit tests with no Task
   dependency.
+
+---
+
+## 4. Simulation Runner
+
+### 4.1 Overview
+
+The `Simulation` class is the top-level orchestrator.  It wires together a set
+of `Task` instances and two `ReplicaPool`s (inference and judge), then runs a
+synchronous discrete-event loop until every task is consumed or a safety tick
+limit is reached.
+
+All configuration is captured in a frozen `SimConfig` dataclass.  An optional
+RNG seed makes runs fully reproducible.
+
+### 4.2 Per-tick loop
+
+Each tick executes three phases in order:
+
+```
+Phase 1 — Dispatch    greedily submit rollouts/judges for active tasks
+Phase 2 — Tick        advance all in-flight items, release pool slots
+Phase 3 — Consume     auto-consume any task that reached READY
+```
+
+**Phase 1 (Dispatch):** Iterates tasks in creation order.  For each
+non-consumed task, dispatches as many rollouts and judges as both the task's
+pending count and the corresponding pool's available slots allow:
+
+```python
+can_rollout = min(task.pending_rollout, inference_pool.available)
+can_judge   = min(task.pending_judge, judge_pool.available)
+```
+
+Duration for each dispatched trajectory is sampled from a user-supplied
+distribution function `(n: int, rng: Generator) -> list[int]`.
+
+**Phase 2 (Tick):** Calls `task.tick()` on every active task.  Completed
+rollouts release inference pool slots; completed judges release judge pool
+slots.
+
+**Phase 3 (Consume):** Any task in `READY` state is immediately consumed.
+This phase will later be replaced by a training gate.
+
+### 4.3 Configuration (`SimConfig`)
+
+| Field | Type | Description |
+|---|---|---|
+| `n_tasks` | `int` | Total tasks to simulate (>= 1). |
+| `n_trajectories` | `int` | Trajectories per task (>= 1). |
+| `inference_capacity` | `int` | Inference replica pool size (>= 1). |
+| `judge_capacity` | `int` | Judge replica pool size (>= 1). |
+| `rollout_duration_fn` | `(int, Generator) -> list[int]` | Samples rollout durations. |
+| `judge_duration_fn` | `(int, Generator) -> list[int]` | Samples judge durations. |
+| `max_ticks` | `int` | Safety tick limit (default 100 000). |
+| `seed` | `int \| None` | RNG seed for reproducibility. |
+
+Two built-in duration factories are provided:
+
+- `constant_duration(value)` — every item takes exactly *value* ticks.
+- `uniform_duration(low, high)` — each item sampled uniformly from `[low, high]`.
+
+### 4.4 Result types
+
+`SimResult` captures:
+
+- `ticks_elapsed` — how many ticks the simulation ran.
+- `tasks_completed` — how many tasks reached `CONSUMED`.
+- `history` — a `list[TickStats]` with per-tick snapshots (dispatch counts,
+  completion counts, pool utilisation, task-state distribution).
+
+### 4.5 Entry point
+
+`run_sim.py` at the project root configures a default `SimConfig` and prints
+a summary table with periodic snapshots.  Run via:
+
+```bash
+uv run run_sim.py
+```
+
+### 4.6 Design decisions
+
+- **All tasks created at tick 0** — simplest starting point; arrival
+  scheduling is a future extension.
+- **Greedy dispatch order** — tasks are visited in creation order; a priority
+  policy (e.g. closest-to-completion first) can be swapped in later.
+- **Auto-consume** — since training is excluded, `READY` tasks are consumed
+  immediately; this slot will later be replaced by a training gate.
+- **No async / no threads** — the loop is pure synchronous discrete-event
+  simulation.  "Async" in the project name refers to the RL pipeline model,
+  not Python coroutines.
