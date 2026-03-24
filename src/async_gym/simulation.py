@@ -522,6 +522,7 @@ class Simulation:
             max_staleness=cfg.max_staleness,
             training_in_flight=self._training_in_flight is not None,
             ready_buffer_size=len(self._ready_buffer),
+            max_active_staleness=self._current_max_staleness(),
         )
 
     def _validate_rollout_plan(

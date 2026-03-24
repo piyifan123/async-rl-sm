@@ -644,6 +644,6 @@ Other example strategies:
 
 - **Fair-share** — spread slots evenly across active tasks instead of greedy
   first-come-first-served.
-- **Back-pressure** — tighten admission (e.g. also require
-  `not view.training_in_flight` or `view.ready_buffer_size < batch_size`)
-  to avoid wasting compute on tasks that will go stale.
+- **Back-pressure** — tighten admission based on projected staleness.
+  `SRPTAgingScheduler` now implements this via a staleness-aware
+  admission gate (see [scheduling.md](scheduling.md) §5.4).

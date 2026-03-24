@@ -204,9 +204,9 @@ _register(
         name="srpt-heavy-tail",
         description=(
             "Heavy-tailed bimodal rollouts (85% 1-tick, 15% 60-tick) with "
-            "32 tasks competing for scarce judge capacity.  SRPT-Aging "
-            "finishes ~35% faster and drops 1 fewer task than FIFO by "
-            "prioritising tasks closest to READY."
+            "32 tasks competing for scarce judge capacity.  SRPT-Aging's "
+            "staleness-aware admission eliminates all drops (vs 3 for FIFO) "
+            "by throttling admission when checkpoint pressure is high."
         ),
         config=SimConfig(
             n_tasks=32,

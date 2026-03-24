@@ -67,6 +67,8 @@ class SchedulerView:
         training_in_flight: Whether a training run is currently in progress.
         ready_buffer_size: Number of READY tasks waiting in the training
             buffer.
+        max_active_staleness: Maximum staleness across all active
+            (non-terminal, admitted) tasks, or 0 if there are none.
     """
 
     tick: int
@@ -81,6 +83,7 @@ class SchedulerView:
     max_staleness: int
     training_in_flight: bool
     ready_buffer_size: int
+    max_active_staleness: int
 
 
 @dataclass(frozen=True)
@@ -318,21 +321,36 @@ class SRPTAgingScheduler(Scheduler):
     competing task with *w < W* remaining work after at most
     ``(W - w) / aging_factor`` idle ticks.
 
-    **Admission** is identical to :class:`GreedyFIFOScheduler` — admit while
-    ``active_count < pipeline_cap``.
+    **Admission** uses a projected-staleness gate that estimates pending
+    checkpoint advances and blocks admission when the oldest active task
+    would be pushed past the staleness limit.  Set ``admit_headroom=None``
+    to fall back to the simple pipeline-cap gate used by the baseline.
 
     Args:
         aging_factor: Non-negative weight applied to each tick of age.
             Defaults to ``1.0``.
+        admit_headroom: Staleness headroom required for admission.
+            The gate blocks when ``projected_staleness >
+            max_staleness - admit_headroom``.  ``None`` disables the
+            staleness-aware gate entirely (simple pipeline-cap only).
+            Defaults to ``1``.
 
     Raises:
-        ValueError: If *aging_factor* is negative.
+        ValueError: If *aging_factor* is negative or *admit_headroom*
+            is negative.
     """
 
-    def __init__(self, aging_factor: float = 1.0) -> None:
+    def __init__(
+        self,
+        aging_factor: float = 1.0,
+        admit_headroom: int | None = 1,
+    ) -> None:
         if aging_factor < 0:
             raise ValueError(f"aging_factor must be >= 0, got {aging_factor}")
+        if admit_headroom is not None and admit_headroom < 0:
+            raise ValueError(f"admit_headroom must be >= 0 or None, got {admit_headroom}")
         self._aging_factor = aging_factor
+        self._admit_headroom = admit_headroom
         self._admission_ticks: dict[str, int] = {}
 
     @property
@@ -345,15 +363,23 @@ class SRPTAgingScheduler(Scheduler):
         """The aging weight used in the priority score."""
         return self._aging_factor
 
+    @property
+    def admit_headroom(self) -> int | None:
+        """Staleness headroom required for admission, or ``None`` if disabled."""
+        return self._admit_headroom
+
     def should_admit(
         self,
         task: Task,
         active_count: int,
         view: SchedulerView,
     ) -> bool:
-        """Admit while under the pipeline cap (same as baseline).
+        """Decide whether to admit a PENDING task using staleness-aware gating.
 
-        Also records the admission tick for later age computation.
+        The pipeline-cap ceiling is always enforced.  When
+        ``admit_headroom`` is not ``None``, a projected-staleness gate
+        additionally blocks admission if the oldest active task would be
+        pushed past the staleness limit by pending checkpoint advances.
 
         Args:
             task: A PENDING task.
@@ -361,12 +387,38 @@ class SRPTAgingScheduler(Scheduler):
             view: Simulation state snapshot.
 
         Returns:
-            ``True`` if ``active_count < view.pipeline_cap``.
+            ``True`` to admit, ``False`` to defer to a later tick.
         """
-        if active_count < view.pipeline_cap:
-            self._admission_ticks[task.task_id] = view.tick
-            return True
-        return False
+        if active_count >= view.pipeline_cap:
+            return False
+
+        if self._admit_headroom is not None:
+            pending = self._pending_checkpoint_advances(view)
+            projected = view.max_active_staleness + pending
+            if projected > view.max_staleness - self._admit_headroom:
+                return False
+
+        self._admission_ticks[task.task_id] = view.tick
+        return True
+
+    @staticmethod
+    def _pending_checkpoint_advances(view: SchedulerView) -> int:
+        """Estimate checkpoint advances already committed in the pipeline.
+
+        Counts in-flight training (will advance the checkpoint on
+        completion) plus full batches sitting in the ready buffer.
+
+        Args:
+            view: Simulation state snapshot.
+
+        Returns:
+            Non-negative count of expected upcoming checkpoint advances.
+        """
+        advances = 0
+        if view.training_in_flight:
+            advances += 1
+        advances += view.ready_buffer_size // view.batch_size
+        return advances
 
     def _score(self, pending: int, task_id: str, current_tick: int) -> float:
         """Compute the dispatch priority score for a task.

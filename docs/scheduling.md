@@ -241,13 +241,62 @@ optimal given the sorted order — there is no benefit to under-allocating a
 higher-priority task to "save" slots for a lower-priority one, because the
 higher-priority task is expected to finish sooner and free slots earlier.
 
-### 5.4  Admission Policy
+### 5.4  Staleness-Aware Admission
 
-Admission is intentionally kept identical to the baseline (`active_count <
-pipeline_cap`).  Admission controls the *number* of tasks in flight; dispatch
-controls the *allocation of resources* among them.  Decoupling these concerns
-allows the scheduling strategy to be evaluated independently of pipeline
-depth tuning.
+The baseline `GreedyFIFOScheduler` uses a simple pipeline-cap gate:
+`active_count < pipeline_cap`.  `SRPTAgingScheduler` layers a
+**projected-staleness gate** on top of that cap to prevent drops caused
+by unchecked checkpoint advancement.
+
+#### Problem
+
+Under variable rollout durations, SRPT's throughput advantage can
+*accelerate* staleness for slow tasks.  Fast tasks finish quickly, fill
+training batches, and advance the checkpoint — while slow tasks hold a
+pipeline slot.  By the time a slow task reaches READY, its
+`birth_ckpt` is far behind `ckpt_version` and it is dropped.
+
+#### Gate formula
+
+Before admitting a new task, compute:
+
+```
+pending_advances = (1 if training_in_flight else 0)
+                 + ready_buffer_size // batch_size
+
+projected_staleness = max_active_staleness + pending_advances
+```
+
+Admission is blocked when:
+
+```
+projected_staleness > max_staleness - admit_headroom
+```
+
+- `max_active_staleness` is the worst staleness across all
+  non-terminal admitted tasks (`ckpt_version - min(birth_ckpt)`),
+  provided by `SchedulerView`.
+- `pending_advances` counts checkpoint advances that are already
+  committed: one for in-flight training, plus one for each full batch
+  waiting in the ready buffer.
+- `admit_headroom` (default 1) reserves a staleness buffer so that
+  a newly admitted fast task cannot push the oldest task past the
+  limit before it finishes.
+
+Setting `admit_headroom = None` disables the gate entirely, reverting
+to the simple pipeline-cap rule.
+
+#### Interaction with dispatch
+
+The admission gate and SRPT-Aging dispatch are complementary:
+
+- **Admission** controls *how many* tasks enter the pipeline, limiting
+  the checkpoint-advancement rate.
+- **Dispatch** controls *which* active tasks receive resources,
+  ensuring slow (aging) tasks eventually get priority.
+
+Together they eliminate most drops that the pipeline-cap alone cannot
+prevent.
 
 ---
 
@@ -281,7 +330,29 @@ tasks, measured in the pending-work dimension being scheduled).
    effectively FIFO with a small transient SRPT effect from partially
    completed work — α has minimal impact.
 
-### 6.3  Interaction with `max_staleness` and `pipeline_cap`
+### 6.3  Choosing `admit_headroom`
+
+| `admit_headroom` | Behaviour |
+|-------------------|-----------|
+| `None`            | Gate disabled — simple pipeline-cap only (old behaviour) |
+| 0                 | Block only when projected staleness **exceeds** `max_staleness`.  Minimal protection; a fast task admitted at the boundary can still cause a drop. |
+| **1** (default)   | Block when projected staleness **reaches** `max_staleness`.  Provides one unit of breathing room — sufficient for most workloads. |
+| 2+                | More conservative; useful when training duration variance is high and checkpoint advances are hard to predict. |
+
+**Rules of thumb:**
+
+1. **Start with 1.**  This eliminates most drops with minimal throughput
+   cost.
+2. **If drops persist**, raise to 2.  This can happen when long training
+   durations delay checkpoint advances, causing the estimate of
+   `pending_advances` to be slightly optimistic.
+3. **If utilisation drops noticeably**, lower to 0 or `None`.  Tight
+   headroom can cause the pipeline to idle while waiting for slow tasks
+   to finish before admitting new work.
+4. **For homogeneous workloads** (constant durations), headroom has
+   little effect because all tasks finish at similar times.
+
+### 6.4  Interaction with `max_staleness` and `pipeline_cap`
 
 The pipeline cap limits how many tasks are active simultaneously.  With a
 small pipeline cap, fewer tasks compete and the scheduling order matters
@@ -295,16 +366,19 @@ less.  The SRPT-Aging advantage is most pronounced when:
 
 ## 7  Summary
 
-| Scheduler      | Dispatch order                | Starvation-free | Mean flow time |
-|----------------|-------------------------------|-----------------|----------------|
-| Greedy FIFO    | Creation order                | Yes             | Baseline       |
-| SRPT (α = 0)   | Shortest remaining first     | No              | Optimal (M/G/1)|
-| SRPT-Aging     | Shortest remaining + age boost| Yes (bounded)   | Near-optimal   |
+| Scheduler      | Dispatch order                | Starvation-free | Drop protection | Mean flow time |
+|----------------|-------------------------------|-----------------|-----------------|----------------|
+| Greedy FIFO    | Creation order                | Yes             | Pipeline cap    | Baseline       |
+| SRPT (α = 0)   | Shortest remaining first     | No              | Pipeline cap    | Optimal (M/G/1)|
+| SRPT-Aging     | Shortest remaining + age boost| Yes (bounded)   | Staleness gate  | Near-optimal   |
 
 SRPT-Aging combines the flow-time benefits of SRPT with the starvation
 guarantees needed to avoid wasteful drops in the async-RL pipeline.  The
-single `aging_factor` parameter provides a simple, interpretable knob for
-trading off responsiveness against fairness.
+staleness-aware admission gate adds checkpoint-pressure back-pressure,
+eliminating most drops that the pipeline cap alone cannot prevent.  Two
+parameters — `aging_factor` and `admit_headroom` — provide simple,
+interpretable knobs for trading off responsiveness against fairness and
+throughput against drop avoidance.
 
 ---
 
@@ -344,14 +418,15 @@ batches sooner.
 
 | Metric | FIFO | SRPT-Aging | Improvement |
 |--------|------|------------|-------------|
-| Ticks elapsed | 269 | 161 | −40% |
+| Ticks elapsed | 269 | 172 | −36% |
 | Tasks dropped | 2 | 0 | −2 |
-| Avg inference util | 45% | 78% | +33 pp |
-| Avg judge util | 48% | 80% | +32 pp |
+| Avg inference util | 45% | 73% | +28 pp |
+| Avg judge util | 48% | 74% | +26 pp |
 
 The 80/20 bimodal split creates a mix of "easy" and "hard" trajectories.
-SRPT completes the easy tasks quickly, filling training batches faster
-and advancing checkpoints before slow tasks go stale.
+SRPT completes the easy tasks quickly, filling training batches faster.
+The staleness-aware admission gate prevents checkpoint advancement from
+outpacing slow tasks, eliminating both drops.
 
 ### 8.3  Scenario: `srpt-heavy-tail`
 
@@ -367,14 +442,17 @@ and advancing checkpoints before slow tasks go stale.
 
 | Metric | FIFO | SRPT-Aging | Improvement |
 |--------|------|------------|-------------|
-| Ticks elapsed | 374 | 243 | −35% |
-| Tasks dropped | 3 | 2 | −1 |
-| Avg inference util | 46% | 72% | +26 pp |
-| Avg judge util | 46% | 70% | +24 pp |
+| Ticks elapsed | 374 | 392 | +5% |
+| Tasks dropped | 3 | 0 | −3 |
+| Tasks completed | 29 | 32 | +3 |
+| Avg inference util | 46% | 44% | −2 pp |
+| Avg judge util | 46% | 44% | −2 pp |
 
 With 32 tasks and a heavier tail (15% of trajectories take 60 ticks),
-the pipeline cap of 12 creates severe judge contention.  SRPT's
-reordering is even more valuable at scale.
+the pipeline cap of 12 creates severe judge contention.  The
+staleness-aware admission gate eliminates all 3 drops by throttling
+admission when checkpoint pressure is high, trading a small amount of
+wall-clock time for zero wasted compute.
 
 ### 8.4  Scenario: `srpt-contention`
 
@@ -390,13 +468,13 @@ reordering is even more valuable at scale.
 
 | Metric | FIFO | SRPT-Aging | Improvement |
 |--------|------|------------|-------------|
-| Ticks elapsed | 434 | 315 | −27% |
+| Ticks elapsed | 434 | 214 | −51% |
 | Tasks dropped | 0 | 0 | 0 |
-| Avg inference util | 32% | 46% | +14 pp |
-| Avg judge util | 33% | 46% | +13 pp |
+| Avg inference util | 32% | 69% | +37 pp |
+| Avg judge util | 33% | 67% | +34 pp |
 
 This scenario isolates the **pure throughput advantage**: no tasks are
-dropped under either scheduler, so the 27% speed-up comes entirely from
-smarter dispatch ordering.  The longer judge duration (3 ticks) holds
-judge slots longer, magnifying the cost of serving tasks in the wrong
-order.
+dropped under either scheduler.  The staleness-aware admission gate
+reduces pipeline congestion, letting SRPT's dispatch ordering be more
+effective.  The longer judge duration (3 ticks) holds judge slots
+longer, magnifying the benefit of serving nearly-done tasks first.

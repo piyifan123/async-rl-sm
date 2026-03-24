@@ -43,6 +43,7 @@ def _make_view(**overrides: object) -> SchedulerView:
         "max_staleness": 2,
         "training_in_flight": False,
         "ready_buffer_size": 0,
+        "max_active_staleness": 0,
     }
     defaults.update(overrides)
     return SchedulerView(**defaults)  # type: ignore[arg-type]
@@ -542,6 +543,7 @@ class TestSchedulerView:
             max_staleness=2,
             training_in_flight=True,
             ready_buffer_size=1,
+            max_active_staleness=2,
         )
         assert view.tick == 5
         assert view.ckpt_version == 2
@@ -555,6 +557,7 @@ class TestSchedulerView:
         assert view.max_staleness == 2
         assert view.training_in_flight is True
         assert view.ready_buffer_size == 1
+        assert view.max_active_staleness == 2
 
     def test_view_is_frozen(self) -> None:
         view = _make_view()
@@ -608,6 +611,26 @@ class TestSRPTAgingConstructor:
         with pytest.raises(ValueError, match="aging_factor must be >= 0"):
             SRPTAgingScheduler(aging_factor=-0.1)
 
+    def test_default_admit_headroom(self) -> None:
+        sched = SRPTAgingScheduler()
+        assert sched.admit_headroom == 1
+
+    def test_custom_admit_headroom(self) -> None:
+        sched = SRPTAgingScheduler(admit_headroom=2)
+        assert sched.admit_headroom == 2
+
+    def test_none_admit_headroom(self) -> None:
+        sched = SRPTAgingScheduler(admit_headroom=None)
+        assert sched.admit_headroom is None
+
+    def test_zero_admit_headroom(self) -> None:
+        sched = SRPTAgingScheduler(admit_headroom=0)
+        assert sched.admit_headroom == 0
+
+    def test_rejects_negative_admit_headroom(self) -> None:
+        with pytest.raises(ValueError, match="admit_headroom must be >= 0 or None"):
+            SRPTAgingScheduler(admit_headroom=-1)
+
 
 # ------------------------------------------------------------------
 # SRPTAgingScheduler.name
@@ -655,6 +678,199 @@ class TestSRPTAgingAdmission:
         view = _make_view(pipeline_cap=4, tick=5)
         sched.should_admit(task, 0, view)
         assert sched._admission_ticks["t0"] == 5  # noqa: SLF001
+
+
+# ------------------------------------------------------------------
+# SRPTAgingScheduler staleness-aware admission
+# ------------------------------------------------------------------
+
+
+class TestSRPTAgingStalenessAdmission:
+    """Tests for the projected-staleness admission gate."""
+
+    def test_admits_when_no_staleness_pressure(self) -> None:
+        """Zero staleness and no pending advances → admit."""
+        sched = SRPTAgingScheduler(admit_headroom=1)
+        task = _make_task()
+        view = _make_view(
+            pipeline_cap=4,
+            max_staleness=3,
+            max_active_staleness=0,
+            training_in_flight=False,
+            ready_buffer_size=0,
+        )
+        assert sched.should_admit(task, 0, view) is True
+
+    def test_blocks_when_staleness_equals_limit_minus_headroom(self) -> None:
+        """projected > max_staleness - headroom → reject."""
+        sched = SRPTAgingScheduler(admit_headroom=1)
+        task = _make_task()
+        view = _make_view(
+            pipeline_cap=4,
+            max_staleness=3,
+            max_active_staleness=3,
+            training_in_flight=False,
+            ready_buffer_size=0,
+        )
+        assert sched.should_admit(task, 0, view) is False
+
+    def test_blocks_when_pending_advances_push_over(self) -> None:
+        """Training in-flight adds 1 to projected staleness."""
+        sched = SRPTAgingScheduler(admit_headroom=1)
+        task = _make_task()
+        view = _make_view(
+            pipeline_cap=4,
+            max_staleness=3,
+            max_active_staleness=1,
+            training_in_flight=True,
+            ready_buffer_size=0,
+        )
+        # projected = 1 + 1 = 2, threshold = 3 - 1 = 2, 2 > 2 is False
+        assert sched.should_admit(task, 0, view) is True
+
+    def test_blocks_when_training_plus_buffer_push_over(self) -> None:
+        """Training in-flight + full batch in buffer = 2 pending advances."""
+        sched = SRPTAgingScheduler(admit_headroom=1)
+        task = _make_task()
+        view = _make_view(
+            pipeline_cap=4,
+            max_staleness=3,
+            max_active_staleness=1,
+            training_in_flight=True,
+            ready_buffer_size=4,
+            batch_size=4,
+        )
+        # pending = 1 (training) + 1 (4//4 buffer batch) = 2
+        # projected = 1 + 2 = 3, threshold = 3 - 1 = 2, 3 > 2 → reject
+        assert sched.should_admit(task, 0, view) is False
+
+    def test_ready_buffer_counts_full_batches_only(self) -> None:
+        """Partial batches in the ready buffer don't count as advances."""
+        sched = SRPTAgingScheduler(admit_headroom=1)
+        task = _make_task()
+        view = _make_view(
+            pipeline_cap=4,
+            max_staleness=3,
+            max_active_staleness=1,
+            training_in_flight=False,
+            ready_buffer_size=3,
+            batch_size=4,
+        )
+        # pending = 0 (no training) + 0 (3//4 = 0) = 0
+        # projected = 1 + 0 = 1, threshold = 2, 1 > 2 → admit
+        assert sched.should_admit(task, 0, view) is True
+
+    def test_headroom_none_disables_gate(self) -> None:
+        """With admit_headroom=None, only the pipeline cap is checked."""
+        sched = SRPTAgingScheduler(admit_headroom=None)
+        task = _make_task()
+        view = _make_view(
+            pipeline_cap=4,
+            max_staleness=2,
+            max_active_staleness=10,
+            training_in_flight=True,
+            ready_buffer_size=8,
+            batch_size=1,
+        )
+        assert sched.should_admit(task, 0, view) is True
+
+    def test_headroom_zero_only_blocks_past_limit(self) -> None:
+        """headroom=0 blocks only when projected > max_staleness."""
+        sched = SRPTAgingScheduler(admit_headroom=0)
+        task = _make_task()
+        # projected = 2 + 0 = 2, threshold = 2 - 0 = 2, 2 > 2 is False → admit
+        view_at_limit = _make_view(
+            pipeline_cap=4,
+            max_staleness=2,
+            max_active_staleness=2,
+            training_in_flight=False,
+            ready_buffer_size=0,
+        )
+        assert sched.should_admit(task, 0, view_at_limit) is True
+        # projected = 2 + 1 = 3, 3 > 2 → reject
+        view_over = _make_view(
+            pipeline_cap=4,
+            max_staleness=2,
+            max_active_staleness=2,
+            training_in_flight=True,
+            ready_buffer_size=0,
+        )
+        assert sched.should_admit(task, 0, view_over) is False
+
+    def test_headroom_2_is_more_conservative(self) -> None:
+        """headroom=2 blocks earlier than headroom=1."""
+        task = _make_task()
+        view = _make_view(
+            pipeline_cap=4,
+            max_staleness=3,
+            max_active_staleness=1,
+            training_in_flight=False,
+            ready_buffer_size=0,
+        )
+        # projected = 1 + 0 = 1
+        h1 = SRPTAgingScheduler(admit_headroom=1)
+        h2 = SRPTAgingScheduler(admit_headroom=2)
+        # h1: 1 > (3-1)=2? No → admit
+        assert h1.should_admit(task, 0, view) is True
+        # h2: 1 > (3-2)=1? No → admit (boundary)
+        assert h2.should_admit(task, 0, view) is True
+
+        view_higher = _make_view(
+            pipeline_cap=4,
+            max_staleness=3,
+            max_active_staleness=2,
+            training_in_flight=False,
+            ready_buffer_size=0,
+        )
+        task2 = _make_task("t1")
+        task3 = _make_task("t2")
+        # projected = 2; h1: 2 > 2? No → admit; h2: 2 > 1? Yes → reject
+        assert h1.should_admit(task2, 0, view_higher) is True
+        assert h2.should_admit(task3, 0, view_higher) is False
+
+    def test_pipeline_cap_still_enforced_with_headroom(self) -> None:
+        """Pipeline cap is always enforced even when staleness is zero."""
+        sched = SRPTAgingScheduler(admit_headroom=1)
+        task = _make_task()
+        view = _make_view(
+            pipeline_cap=2,
+            max_staleness=10,
+            max_active_staleness=0,
+        )
+        assert sched.should_admit(task, 2, view) is False
+
+
+# ------------------------------------------------------------------
+# SRPTAgingScheduler._pending_checkpoint_advances
+# ------------------------------------------------------------------
+
+
+class TestPendingCheckpointAdvances:
+    """Tests for the pending-advances estimate helper."""
+
+    def test_no_training_no_buffer(self) -> None:
+        view = _make_view(training_in_flight=False, ready_buffer_size=0, batch_size=4)
+        assert SRPTAgingScheduler._pending_checkpoint_advances(view) == 0
+
+    def test_training_in_flight(self) -> None:
+        view = _make_view(training_in_flight=True, ready_buffer_size=0, batch_size=4)
+        assert SRPTAgingScheduler._pending_checkpoint_advances(view) == 1
+
+    def test_full_batch_in_buffer(self) -> None:
+        view = _make_view(training_in_flight=False, ready_buffer_size=4, batch_size=4)
+        assert SRPTAgingScheduler._pending_checkpoint_advances(view) == 1
+
+    def test_multiple_batches_in_buffer(self) -> None:
+        view = _make_view(training_in_flight=False, ready_buffer_size=9, batch_size=4)
+        assert SRPTAgingScheduler._pending_checkpoint_advances(view) == 2
+
+    def test_training_plus_buffer(self) -> None:
+        view = _make_view(training_in_flight=True, ready_buffer_size=8, batch_size=4)
+        assert SRPTAgingScheduler._pending_checkpoint_advances(view) == 3
+
+    def test_partial_buffer_not_counted(self) -> None:
+        view = _make_view(training_in_flight=False, ready_buffer_size=3, batch_size=4)
+        assert SRPTAgingScheduler._pending_checkpoint_advances(view) == 0
 
 
 # ------------------------------------------------------------------
@@ -908,3 +1124,22 @@ class TestSRPTAgingIntegration:
         )
         result = Simulation(cfg, scheduler=SRPTAgingScheduler(aging_factor=0.0)).run()
         assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks
+
+    def test_headroom_none_matches_old_behaviour(self) -> None:
+        """``admit_headroom=None`` gives the same dispatch as SRPT without the gate."""
+        cfg = SimConfig(
+            n_tasks=20,
+            n_trajectories=8,
+            inference_capacity=16,
+            judge_capacity=3,
+            rollout_duration_fn=constant_duration(5),
+            judge_duration_fn=constant_duration(2),
+            batch_size=4,
+            max_staleness=3,
+            seed=99,
+        )
+        r_none = Simulation(cfg, scheduler=SRPTAgingScheduler(admit_headroom=None)).run()
+        r_none2 = Simulation(cfg, scheduler=SRPTAgingScheduler(admit_headroom=None)).run()
+        assert r_none.ticks_elapsed == r_none2.ticks_elapsed
+        assert r_none.tasks_completed == r_none2.tasks_completed
+        assert r_none.tasks_dropped == r_none2.tasks_dropped

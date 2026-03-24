@@ -88,7 +88,12 @@ class TestSRPTBimodal:
 
 
 class TestSRPTHeavyTail:
-    """SRPT-Aging beats FIFO on the ``srpt-heavy-tail`` scenario."""
+    """SRPT-Aging beats FIFO on the ``srpt-heavy-tail`` scenario.
+
+    With staleness-aware admission, SRPT-Aging trades a small amount of
+    wall-clock time for zero drops.  FIFO appears "faster" only because
+    it gives up on tasks that go stale.
+    """
 
     @pytest.fixture(scope="class")
     def results(self) -> tuple:
@@ -98,9 +103,9 @@ class TestSRPTHeavyTail:
         srpt = Simulation(cfg, SRPTAgingScheduler()).run()
         return fifo, srpt
 
-    def test_srpt_finishes_faster(self, results: tuple) -> None:
+    def test_srpt_completes_more_tasks(self, results: tuple) -> None:
         fifo, srpt = results
-        assert srpt.ticks_elapsed < fifo.ticks_elapsed
+        assert srpt.tasks_completed >= fifo.tasks_completed
 
     def test_srpt_fewer_drops(self, results: tuple) -> None:
         fifo, srpt = results
@@ -132,3 +137,82 @@ class TestSRPTContention:
         avg_fifo = sum(s.inference_utilization for s in fifo.history) / len(fifo.history)
         avg_srpt = sum(s.inference_utilization for s in srpt.history) / len(srpt.history)
         assert avg_srpt > avg_fifo
+
+
+# ------------------------------------------------------------------
+# Staleness-aware admission integration tests
+# ------------------------------------------------------------------
+
+
+class TestStalenessAdmissionAdversarial:
+    """The staleness-aware gate eliminates drops on the adversarial scenario.
+
+    Without the gate (``admit_headroom=None``), SRPT-Aging on this scenario
+    still drops tasks because fast tasks cycle through the pipeline and
+    advance the checkpoint while slow tasks are stuck.  With the default
+    headroom, admission is throttled to protect slow tasks.
+    """
+
+    @pytest.fixture(scope="class")
+    def results(self) -> tuple:
+        cfg = get_scenario("adversarial").config
+        no_gate = Simulation(cfg, SRPTAgingScheduler(admit_headroom=None)).run()
+        with_gate = Simulation(cfg, SRPTAgingScheduler(admit_headroom=1)).run()
+        return no_gate, with_gate
+
+    def test_gate_reduces_drops(self, results: tuple) -> None:
+        no_gate, with_gate = results
+        assert with_gate.tasks_dropped < no_gate.tasks_dropped
+
+    def test_gate_completes_more_tasks(self, results: tuple) -> None:
+        no_gate, with_gate = results
+        assert with_gate.tasks_completed >= no_gate.tasks_completed
+
+    def test_all_tasks_accounted_for(self, results: tuple) -> None:
+        cfg = get_scenario("adversarial").config
+        for result in results:
+            assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks
+
+
+class TestStalenessAdmissionHeavyTail:
+    """The staleness-aware gate eliminates drops on the heavy-tail scenario."""
+
+    @pytest.fixture(scope="class")
+    def results(self) -> tuple:
+        cfg = get_scenario("srpt-heavy-tail").config
+        no_gate = Simulation(cfg, SRPTAgingScheduler(admit_headroom=None)).run()
+        with_gate = Simulation(cfg, SRPTAgingScheduler(admit_headroom=1)).run()
+        return no_gate, with_gate
+
+    def test_gate_eliminates_drops(self, results: tuple) -> None:
+        _no_gate, with_gate = results
+        assert with_gate.tasks_dropped == 0
+
+    def test_no_gate_has_drops(self, results: tuple) -> None:
+        no_gate, _with_gate = results
+        assert no_gate.tasks_dropped > 0
+
+    def test_gate_completes_all_tasks(self, results: tuple) -> None:
+        cfg = get_scenario("srpt-heavy-tail").config
+        _no_gate, with_gate = results
+        assert with_gate.tasks_completed == cfg.n_tasks
+
+
+class TestStalenessAdmissionBimodal:
+    """The staleness-aware gate on the bimodal scenario (already 0 drops)."""
+
+    @pytest.fixture(scope="class")
+    def results(self) -> tuple:
+        cfg = get_scenario("srpt-bimodal").config
+        no_gate = Simulation(cfg, SRPTAgingScheduler(admit_headroom=None)).run()
+        with_gate = Simulation(cfg, SRPTAgingScheduler(admit_headroom=1)).run()
+        return no_gate, with_gate
+
+    def test_gate_no_worse_drops(self, results: tuple) -> None:
+        no_gate, with_gate = results
+        assert with_gate.tasks_dropped <= no_gate.tasks_dropped
+
+    def test_all_tasks_accounted_for(self, results: tuple) -> None:
+        cfg = get_scenario("srpt-bimodal").config
+        for result in results:
+            assert result.tasks_completed + result.tasks_dropped == cfg.n_tasks
