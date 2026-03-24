@@ -29,6 +29,9 @@ CONFIG = SimConfig(
     judge_capacity=4,
     rollout_duration_fn=uniform_duration(2, 10),
     judge_duration_fn=uniform_duration(1, 4),
+    batch_size=4,
+    training_speed=20.0,
+    max_staleness=3,
     seed=0,
 )
 
@@ -88,6 +91,12 @@ def _print_header(cfg: SimConfig) -> None:
     print(f"  Judge capacity:       {cfg.judge_capacity}")
     print(f"  Rollout duration:     {describe_duration_fn(cfg.rollout_duration_fn)}")
     print(f"  Judge duration:       {describe_duration_fn(cfg.judge_duration_fn)}")
+    print(f"  Batch size:           {cfg.batch_size}")
+    print(
+        f"  Training speed:       {cfg.training_speed}"
+        f"  (duration = ceil(rollout_sample * n_trajectories * batch_size * 3 / speed))"
+    )
+    print(f"  Max staleness:        {cfg.max_staleness}")
     print(f"  Max ticks:            {cfg.max_ticks}")
     print(f"  Seed:                 {cfg.seed}")
     print("-" * 120)
@@ -101,10 +110,12 @@ def _print_snapshots(history: list[TickStats], interval: int) -> None:
         interval: Print every *interval*-th tick plus the final tick.
     """
     print(
-        f"\n{'Tick':>6}  {'Inf%':>5}  {'Jdg%':>5}  {'R_disp':>6}  "
-        f"{'J_disp':>6}  {'R_done':>6}  {'J_done':>6}  State distribution"
+        f"\n{'Tick':>6}  {'Inf%':>5}  {'Jdg%':>5}  {'Trn%':>5}  {'TrnDur':>6}  "
+        f"{'R_disp':>6}  {'J_disp':>6}  {'R_done':>6}  {'J_done':>6}  "
+        f"{'Ckpt':>4}  {'Buf':>3}  {'Stale':>5}  "
+        f"State distribution"
     )
-    print("-" * 120)
+    print("-" * 148)
 
     for stats in history:
         is_periodic = stats.tick % interval == 0
@@ -112,14 +123,20 @@ def _print_snapshots(history: list[TickStats], interval: int) -> None:
         if not (is_periodic or is_last):
             continue
 
+        trn_dur = str(stats.training_ticks_total) if stats.training_active else ""
         print(
             f"{stats.tick:>6}  "
             f"{stats.inference_utilization:>5.1%}  "
             f"{stats.judge_utilization:>5.1%}  "
+            f"{stats.training_utilization:>5.1%}  "
+            f"{trn_dur:>6}  "
             f"{stats.rollouts_dispatched:>6}  "
             f"{stats.judges_dispatched:>6}  "
             f"{stats.rollouts_completed:>6}  "
             f"{stats.judges_completed:>6}  "
+            f"{stats.ckpt_version:>4}  "
+            f"{stats.ready_buffer_size:>3}  "
+            f"{stats.max_task_staleness:>5}  "
             f"{_format_state_distribution(stats)}"
         )
 
@@ -130,24 +147,24 @@ def _print_summary(result: SimResult) -> None:
     Args:
         result: The simulation result.
     """
-    avg_inf = (
-        sum(s.inference_utilization for s in result.history) / len(result.history)
-        if result.history
-        else 0.0
-    )
-    avg_jdg = (
-        sum(s.judge_utilization for s in result.history) / len(result.history)
-        if result.history
-        else 0.0
-    )
+    n = len(result.history) if result.history else 1
+    avg_inf = sum(s.inference_utilization for s in result.history) / n
+    avg_jdg = sum(s.judge_utilization for s in result.history) / n
+    avg_trn = sum(s.training_utilization for s in result.history) / n
+
+    final_ckpt = result.history[-1].ckpt_version if result.history else 0
+    peak_staleness = max(s.max_task_staleness for s in result.history) if result.history else 0
 
     print("\n" + "=" * 120)
     print("Summary")
     print("=" * 120)
     print(f"  Ticks elapsed:        {result.ticks_elapsed}")
     print(f"  Tasks completed:      {result.tasks_completed}")
+    print(f"  Final checkpoint:     {final_ckpt}")
+    print(f"  Peak staleness:       {peak_staleness}")
     print(f"  Avg inference util:   {avg_inf:.1%}")
     print(f"  Avg judge util:       {avg_jdg:.1%}")
+    print(f"  Avg training util:    {avg_trn:.1%}")
     print("=" * 120)
 
 

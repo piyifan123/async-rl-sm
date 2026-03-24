@@ -392,3 +392,47 @@ class TestRepr:
         t = Task(task_id="x", n_trajectories=1)
         assert "_rollouts_in_flight" not in repr(t)
         assert "_judges_in_flight" not in repr(t)
+
+
+# ------------------------------------------------------------------
+# Birth checkpoint and staleness
+# ------------------------------------------------------------------
+
+
+class TestBirthCkptAndStaleness:
+    def test_birth_ckpt_defaults_to_none(self) -> None:
+        t = Task(task_id="s0", n_trajectories=N)
+        assert t.birth_ckpt is None
+
+    def test_birth_ckpt_hidden_in_repr(self) -> None:
+        t = Task(task_id="s0", n_trajectories=N)
+        assert "birth_ckpt" not in repr(t)
+
+    def test_staleness_raises_when_birth_ckpt_not_set(self) -> None:
+        t = Task(task_id="s0", n_trajectories=N)
+        with pytest.raises(ValueError, match="birth_ckpt has not been set"):
+            t.staleness(0)
+
+    def test_staleness_zero_at_birth(self) -> None:
+        t = Task(task_id="s0", n_trajectories=N)
+        t.birth_ckpt = 5
+        assert t.staleness(5) == 0
+
+    def test_staleness_increases_with_ckpt(self) -> None:
+        t = Task(task_id="s0", n_trajectories=N)
+        t.birth_ckpt = 2
+        assert t.staleness(2) == 0
+        assert t.staleness(3) == 1
+        assert t.staleness(5) == 3
+
+    def test_birth_ckpt_survives_through_lifecycle(self) -> None:
+        """birth_ckpt is preserved across state transitions."""
+        t = Task(task_id="s0", n_trajectories=1)
+        t.birth_ckpt = 0
+        t.submit_rollouts([1])
+        t.tick()
+        t.submit_judges([1])
+        t.tick()
+        assert t.state == TaskState.READY
+        assert t.birth_ckpt == 0
+        assert t.staleness(3) == 3

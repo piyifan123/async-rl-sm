@@ -286,12 +286,14 @@ RNG seed makes runs fully reproducible.
 
 ### 4.2 Per-tick loop
 
-Each tick executes three phases in order:
+Each tick executes five phases in order:
 
 ```
-Phase 1 — Dispatch    greedily submit rollouts/judges for active tasks
-Phase 2 — Tick        advance all in-flight items, release pool slots
-Phase 3 — Consume     auto-consume any task that reached READY
+Phase 1 — Dispatch          greedily submit rollouts/judges, throttled by pipeline depth
+Phase 2 — Record util       snapshot pool occupancy after dispatch
+Phase 3 — Advance           tick all in-flight task work and training
+Phase 4 — Collect ready     move newly-READY tasks into the training buffer
+Phase 5 — Training gate     consume a batch and start training when possible
 ```
 
 **Phase 1 (Dispatch):** Iterates tasks in creation order.  For each
@@ -303,26 +305,44 @@ can_rollout = min(task.pending_rollout, inference_pool.available)
 can_judge   = min(task.pending_judge, judge_pool.available)
 ```
 
+PENDING tasks are only promoted (given their first rollout dispatch) when
+the number of active tasks is below the pipeline depth cap
+(`max_staleness * batch_size`).  When a PENDING task is first dispatched,
+its `birth_ckpt` is set to the current global `ckpt_version`.
+
 Duration for each dispatched trajectory is sampled from a user-supplied
 distribution function `(n: int, rng: Generator) -> list[int]`.
 
-**Phase 2 (Tick):** Calls `task.tick()` on every active task.  Completed
-rollouts release inference pool slots; completed judges release judge pool
-slots.
+**Phase 2 (Record utilisation):** Snapshots `inference_pool.in_use / capacity`
+and `judge_pool.in_use / capacity` for the tick record.
 
-**Phase 3 (Consume):** Any task in `READY` state is immediately consumed.
-This phase will later be replaced by a training gate.
+**Phase 3 (Advance):** Calls `task.tick()` on every active task.  Completed
+rollouts release inference pool slots; completed judges release judge pool
+slots.  If a training `InFlight` is active, it is also ticked; when it
+completes, `ckpt_version` is incremented.
+
+**Phase 4 (Collect ready):** Tasks that have just reached `READY` (all
+trajectories judged) are appended to a `_ready_buffer` list in creation order.
+They are **not** consumed yet.
+
+**Phase 5 (Training gate):** If no training is currently in flight and the
+ready buffer contains at least `batch_size` tasks, exactly `batch_size` tasks
+are popped from the front of the buffer, consumed, and a training `InFlight`
+is created with the computed duration.
 
 ### 4.3 Configuration (`SimConfig`)
 
 | Field | Type | Description |
 |---|---|---|
-| `n_tasks` | `int` | Total tasks to simulate (>= 1). |
+| `n_tasks` | `int` | Total tasks to simulate (>= 1, must be a multiple of `batch_size`). |
 | `n_trajectories` | `int` | Trajectories per task (>= 1). |
 | `inference_capacity` | `int` | Inference replica pool size (>= 1). |
 | `judge_capacity` | `int` | Judge replica pool size (>= 1). |
 | `rollout_duration_fn` | `(int, Generator) -> list[int]` | Samples rollout durations. |
 | `judge_duration_fn` | `(int, Generator) -> list[int]` | Samples judge durations. |
+| `batch_size` | `int` | Number of READY tasks consumed per training run (>= 1). |
+| `training_speed` | `float` | Divisor for training duration (>= 1.0). |
+| `max_staleness` | `int` | Maximum checkpoint distance at consumption (>= 1). |
 | `max_ticks` | `int` | Safety tick limit (default 100 000). |
 | `seed` | `int \| None` | RNG seed for reproducibility. |
 
@@ -338,7 +358,9 @@ Two built-in duration factories are provided:
 - `ticks_elapsed` — how many ticks the simulation ran.
 - `tasks_completed` — how many tasks reached `CONSUMED`.
 - `history` — a `list[TickStats]` with per-tick snapshots (dispatch counts,
-  completion counts, pool utilisation, task-state distribution).
+  completion counts, inference/judge/training utilisation, task-state
+  distribution, training status, checkpoint version, ready buffer size,
+  max staleness).
 
 ### 4.5 Entry point
 
@@ -355,8 +377,83 @@ uv run run_sim.py
   scheduling is a future extension.
 - **Greedy dispatch order** — tasks are visited in creation order; a priority
   policy (e.g. closest-to-completion first) can be swapped in later.
-- **Auto-consume** — since training is excluded, `READY` tasks are consumed
-  immediately; this slot will later be replaced by a training gate.
 - **No async / no threads** — the loop is pure synchronous discrete-event
   simulation.  "Async" in the project name refers to the RL pipeline model,
   not Python coroutines.
+
+---
+
+## 5. Training Gate and Staleness Control
+
+### 5.1 Batch-gated training
+
+Tasks are not consumed individually.  Instead, READY tasks accumulate in a
+buffer until at least `batch_size` are available **and** no training run is
+currently in progress.  At that point, exactly `batch_size` tasks are popped
+from the buffer (FIFO order) and consumed, and a training `InFlight` is
+started.
+
+### 5.2 Training duration
+
+Training duration is computed per-run as:
+
+```
+training_ticks = ceil(sampled_rollout_duration * n_trajectories * batch_size * 3 / training_speed)
+```
+
+where `sampled_rollout_duration` is a single sample from the configured
+`rollout_duration_fn`.  The factor of 3 approximates the ratio of training
+compute to rollout compute, and `training_speed` models the relative speed of
+the training hardware.  The result is always at least 1 tick.
+
+### 5.3 Checkpoint versioning
+
+A global `ckpt_version` integer starts at 0 and is incremented by 1 each time
+a training run completes.  This represents the model checkpoint that future
+rollouts would be generated against.
+
+### 5.4 Per-task staleness
+
+Each task records a `birth_ckpt` — the value of `ckpt_version` at the moment
+the scheduler first dispatches rollouts for that task (i.e. the task transitions
+from PENDING).  A task's **staleness** is:
+
+```
+staleness = ckpt_version - birth_ckpt
+```
+
+This measures how many training updates have occurred since the task's data was
+generated.  Higher staleness means the training data is further off-policy.
+
+### 5.5 Pipeline-depth throttle
+
+To guarantee that no task is consumed with staleness exceeding `max_staleness`,
+the scheduler limits the number of **active** tasks (those with `birth_ckpt`
+set and not yet CONSUMED) to:
+
+```
+pipeline_cap = max_staleness * batch_size
+```
+
+The reasoning: each training run consumes exactly `batch_size` tasks and
+increments the checkpoint by 1.  If at most `max_staleness * batch_size` tasks
+are active, then the oldest active task can be at most `max_staleness` training
+runs away from consumption.
+
+During dispatch (Phase 1), PENDING tasks are only promoted when the active
+count is below this cap.  Tasks already in the pipeline continue to receive
+rollout/judge dispatches regardless.
+
+### 5.6 Worked example
+
+Configuration: `batch_size=4, max_staleness=2`, pipeline cap = 8.
+
+1. **Tick 0:** 8 PENDING tasks dispatched (birth_ckpt=0), 12 remain PENDING.
+2. **Tick N:** First 4 become READY, training starts (4 consumed). Active
+   drops to 4, so 4 more PENDING dispatched (birth_ckpt=0 still, active=8).
+3. **Tick N+k:** Training done, ckpt=1. 4 more become READY, training starts.
+   Active drops to 4, 4 more PENDING dispatched (birth_ckpt=1), active=8.
+4. Oldest active tasks have staleness = 1 - 0 = 1 <= 2.
+5. Next training: consumes 4 more, ckpt=2.  Dispatch 4 more (birth_ckpt=2).
+6. All tasks born at ckpt 0 are consumed before ckpt reaches 3, so staleness
+   never exceeds 2.

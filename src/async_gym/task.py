@@ -131,6 +131,7 @@ class Task:
     judged: int = field(init=False, default=0)
 
     _consumed: bool = field(init=False, default=False, repr=False)
+    birth_ckpt: int | None = field(init=False, default=None, repr=False)
 
     _VALID_N_RANGE: ClassVar[range] = range(1, 10_001)
 
@@ -165,6 +166,28 @@ class Task:
     def judges_in_flight(self) -> Sequence[InFlight]:
         """Read-only view of in-flight judge items."""
         return self._judges_in_flight
+
+    def staleness(self, current_ckpt: int) -> int:
+        """Compute how stale this task's data is relative to the current checkpoint.
+
+        Staleness is the number of training steps that have occurred since the
+        task first started rolling out (i.e. ``current_ckpt - birth_ckpt``).
+
+        Args:
+            current_ckpt: The global checkpoint version to measure against.
+
+        Returns:
+            The non-negative staleness count.
+
+        Raises:
+            ValueError: If :attr:`birth_ckpt` has not been set yet (task is
+                still ``PENDING``).
+        """
+        if self.birth_ckpt is None:
+            raise ValueError(
+                f"Cannot compute staleness for task {self.task_id!r}: birth_ckpt has not been set"
+            )
+        return current_ckpt - self.birth_ckpt
 
     # ------------------------------------------------------------------
     # Derived state
